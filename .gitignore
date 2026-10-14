@@ -1,0 +1,30 @@
+# SwiftPM / Swift 构建产物
+.build/
+*.xcodeproj
+*.xcworkspace
+DerivedData/
+.swiftpm/
+build/
+
+# 打包输出（dist/MFan.app 由 scripts/build-app.sh 生成）
+dist/
+
+# macOS 系统文件
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+
+# Xcode 用户状态
+xcuserdata/
+*.xcuserstate
+
+# 编辑器 / 工具
+*.swp
+*~
+.idea/
+.vscode/
+
+# 运行时临时文件（服务日志、socket 所在目录）
+*.log

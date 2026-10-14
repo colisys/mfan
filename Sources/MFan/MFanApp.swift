@@ -1,0 +1,615 @@
+import AppKit
+import FanCore
+import SwiftUI
+
+@main
+struct MFanApp: App {
+    @StateObject private var model = FanModel()
+
+    var body: some Scene {
+        MenuBarExtra {
+            FanMenuView(model: model)
+        } label: {
+            MenuBarLabel(model: model)
+        }
+        .menuBarExtraStyle(.window)
+    }
+}
+
+private enum FanError: LocalizedError {
+    case invalidSnapshot
+    case missingCLI
+    case controlServiceUnavailable
+    case controlRequestFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidSnapshot:
+            return "SMC 返回了无效的风扇数据。"
+        case .missingCLI:
+            return "找不到应用内的 fanctl，请使用打包脚本构建应用。"
+        case .controlServiceUnavailable:
+            return "风扇控制服务未响应，请重新授权。"
+        case .controlRequestFailed(let message):
+            return message
+        }
+    }
+}
+
+// Only the serial read queue accesses this client's SMC state.
+private final class FanReader {
+    private var client: SMCClient?
+
+    func read() throws -> ([FanSnapshot], [TemperatureSnapshot]) {
+        do {
+            if client == nil { client = try SMCClient() }
+            let fans = try client!.fans()
+            let valid = Set(fans.map(\.id)).count == fans.count && fans.allSatisfy {
+                $0.id >= 0 && $0.currentRPM.isFinite && $0.currentRPM >= 0 &&
+                $0.minimumRPM.isFinite && $0.minimumRPM >= 0 &&
+                $0.maximumRPM.isFinite && $0.maximumRPM >= $0.minimumRPM &&
+                $0.maximumRPM < Double(Int.max) &&
+                ceil($0.minimumRPM) <= floor($0.maximumRPM) &&
+                ($0.targetRPM.map { $0.isFinite && $0 >= 0 } ?? true)
+            }
+            guard valid else { throw FanError.invalidSnapshot }
+            let temperatures = try client!.temperatures()
+            return (fans.sorted { $0.id < $1.id }, temperatures)
+        } catch {
+            client = nil
+            throw error
+        }
+    }
+}
+
+@MainActor
+private final class FanModel: ObservableObject {
+    @Published private(set) var fans: [FanSnapshot] = []
+    @Published private(set) var temperatures: [TemperatureSnapshot] = []
+    @Published private(set) var readError: String?
+    @Published private(set) var lastRead: Date?
+    @Published private(set) var hasRead = false
+    @Published private(set) var busy = false
+    @Published private(set) var operation = ""
+    @Published private(set) var commandMessage: String?
+    @Published private(set) var commandFailed = false
+    @Published private(set) var controlConnectionError: String?
+
+    private let readQueue = DispatchQueue(label: "MFan.SMC.read", qos: .utility)
+    private let commands = CommandRunner()
+    private let reader = FanReader()
+    private var controlClient: PrivilegedControlClient?
+    private let serviceID = UUID().uuidString
+    private var reading = false
+    private var timer: DispatchSourceTimer?
+    private var startupSettingAttempted = false
+    private var heartbeatTimer: DispatchSourceTimer?
+    private var heartbeatActivity: NSObjectProtocol?
+    private var heartbeatTask: Task<Void, Never>?
+    private var heartbeatPending = false
+    private var wakeObserver: NSObjectProtocol?
+
+    static var supportsArchitecture: Bool {
+        #if arch(x86_64)
+        true
+        #else
+        false
+        #endif
+    }
+
+    init() {
+        guard Self.supportsArchitecture else {
+            readError = "仅支持 Intel Mac，不支持 Apple Silicon。"
+            return
+        }
+        if Self.isTranslated {
+            readError = "检测到 Rosetta 转译；Apple Silicon 不受支持。"
+            return
+        }
+
+        refresh()
+        let timer = DispatchSource.makeTimerSource(queue: readQueue)
+        timer.schedule(deadline: .now() + 5, repeating: 5, leeway: .milliseconds(250))
+        timer.setEventHandler { [weak self] in
+            Task { @MainActor [weak self] in self?.refresh() }
+        }
+        self.timer = timer
+        timer.resume()
+
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.sendHeartbeat(immediate: true) }
+        }
+    }
+
+    deinit {
+        timer?.cancel()
+        heartbeatTimer?.cancel()
+        heartbeatTask?.cancel()
+        if let heartbeatActivity { ProcessInfo.processInfo.endActivity(heartbeatActivity) }
+        if let wakeObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver)
+        }
+    }
+
+    private static var isTranslated: Bool {
+        var value: Int32 = 0
+        var size = MemoryLayout<Int32>.size
+        return sysctlbyname("sysctl.proc_translated", &value, &size, nil, 0) == 0 && value == 1
+    }
+
+    func refresh() {
+        guard Self.supportsArchitecture, !Self.isTranslated, !reading else { return }
+        reading = true
+        let reader = self.reader
+        readQueue.async { [weak self] in
+            let result = Result { try reader.read() }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.reading = false
+                self.hasRead = true
+
+                switch result {
+                case .success(let result):
+                    if self.fans != result.0 { self.fans = result.0 }
+                    if self.temperatures != result.1 { self.temperatures = result.1 }
+                    self.lastRead = Date()
+                    if self.readError != nil { self.readError = nil }
+
+                    self.applyStartupSettingIfNeeded()
+                case .failure(let error):
+                    if !self.fans.isEmpty { self.fans = [] }
+                    let message = "读取 SMC 失败：\(error.localizedDescription)"
+                    if self.readError != message { self.readError = message }
+                }
+            }
+        }
+    }
+
+    func set(fanID: Int, rpm: Int, seconds: Int) {
+        guard !busy, readError == nil,
+              let fan = fans.first(where: { $0.id == fanID }),
+              Double(rpm) >= ceil(fan.minimumRPM),
+              Double(rpm) <= floor(fan.maximumRPM),
+              seconds == 0 || (30...600).contains(seconds) else { return }
+
+        execute(
+            request: FanControlRequest(command: "set", fan: fanID, rpm: Double(rpm), seconds: seconds),
+            description: seconds == 0
+                ? "风扇 #\(fanID) · \(rpm) RPM · 不限时"
+                : "风扇 #\(fanID) · \(rpm) RPM · \(seconds) 秒"
+        )
+    }
+
+    private func applyStartupSettingIfNeeded() {
+        guard !startupSettingAttempted,
+              UserDefaults.standard.bool(forKey: "startupFanEnabled"),
+              let fan = fans.first(where: { $0.id == UserDefaults.standard.integer(forKey: "startupFanID") }) else { return }
+        let configuredRPM = UserDefaults.standard.double(forKey: "startupFanRPM")
+        let rpm = Int(min(fan.maximumRPM, max(fan.minimumRPM, configuredRPM)))
+        guard rpm > 0 else { return }
+        startupSettingAttempted = true
+        set(fanID: fan.id, rpm: rpm, seconds: 0)
+    }
+
+    private func startHeartbeat(for client: PrivilegedControlClient) async {
+        controlClient = client
+        if heartbeatActivity == nil {
+            // Keep the hidden menu-bar app responsive to lease renewals, without
+            // preventing idle sleep or lid-close sleep.
+            heartbeatActivity = ProcessInfo.processInfo.beginActivity(
+                options: .userInitiatedAllowingIdleSystemSleep,
+                reason: "Maintain the temporary fan-control safety heartbeat"
+            )
+        }
+        if heartbeatTimer == nil {
+            let timer = DispatchSource.makeTimerSource(queue: .main)
+            timer.schedule(deadline: .now() + 10, repeating: 10, leeway: .milliseconds(250))
+            timer.setEventHandler { [weak self] in
+                Task { @MainActor [weak self] in self?.sendHeartbeat() }
+            }
+            heartbeatTimer = timer
+            timer.resume()
+        }
+        sendHeartbeat(immediate: true)
+        await heartbeatTask?.value
+    }
+
+    private func sendHeartbeat(immediate: Bool = false) {
+        guard let client = controlClient else { return }
+        guard heartbeatTask == nil else {
+            // Coalesce wake/connection events into one follow-up, never overlapping sends.
+            if immediate { heartbeatPending = true }
+            return
+        }
+        heartbeatTask = Task { @MainActor [weak self] in
+            let failure: String?
+            do {
+                let response = try await client.send(FanControlRequest(command: "heartbeat"))
+                failure = response.success ? nil : (response.error ?? "控制服务拒绝心跳")
+            } catch {
+                failure = error.localizedDescription
+            }
+            guard let self else { return }
+            self.heartbeatTask = nil
+            if self.controlClient === client {
+                self.controlConnectionError = failure.map {
+                    "控制服务心跳丢失，无法确认手动控制仍有效：\($0)"
+                }
+            }
+            if self.heartbeatPending {
+                self.heartbeatPending = false
+                self.sendHeartbeat()
+            }
+        }
+    }
+
+    func restoreAutomatic() {
+        guard !busy, Self.supportsArchitecture, !Self.isTranslated else { return }
+        execute(
+            request: FanControlRequest(command: "auto"),
+            description: "正在恢复所有风扇的自动控制…"
+        )
+    }
+
+    private func execute(request: FanControlRequest, description: String) {
+        guard !busy else { return }
+        guard let directory = Bundle.main.executableURL?.deletingLastPathComponent() else {
+            commandFailed = true
+            commandMessage = FanError.missingCLI.localizedDescription
+            return
+        }
+
+        let cli = directory.appendingPathComponent("fanctl")
+        guard FileManager.default.isExecutableFile(atPath: cli.path) else {
+            commandFailed = true
+            commandMessage = FanError.missingCLI.localizedDescription
+            return
+        }
+
+        busy = true
+        operation = description
+        commandMessage = nil
+        commandFailed = false
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                self.busy = false
+                self.operation = ""
+                self.refresh()
+            }
+            do {
+                let client: PrivilegedControlClient
+                do {
+                    client = try await self.ensureControlClient()
+                } catch {
+                    // Authorization is allowed only before attempting the user's request.
+                    self.controlClient = nil
+                    try? FileManager.default.removeItem(atPath: self.serviceLogPath)
+                    let script = CommandRunner.authorizationScript(
+                        cli: cli,
+                        arguments: ["serve", self.socketPath],
+                        background: true,
+                        backgroundLogPath: self.serviceLogPath
+                    )
+                    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                        self.commands.submit(script: script) { result in
+                            continuation.resume(with: result)
+                        }
+                    }
+                    client = try await self.waitForControlClient()
+                }
+
+                let response: FanControlResponse
+                do {
+                    response = try await client.send(request)
+                } catch {
+                    // A missing response does not mean the write was not applied. Never replay it.
+                    throw FanError.controlRequestFailed(
+                        "控制请求结果未知，未自动重试：\(error.localizedDescription)"
+                    )
+                }
+                self.commandFailed = !response.success
+                self.commandMessage = response.success
+                    ? (response.message ?? "操作已完成")
+                    : (response.error ?? "控制服务拒绝请求")
+            } catch {
+                self.commandFailed = true
+                self.commandMessage = self.serviceErrorMessage(error)
+            }
+        }
+    }
+
+    func quit() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            if let controlClient {
+                _ = try? await controlClient.send(FanControlRequest(command: "shutdown"))
+            }
+            self.heartbeatTimer?.cancel()
+            self.heartbeatTimer = nil
+            if let activity = self.heartbeatActivity {
+                ProcessInfo.processInfo.endActivity(activity)
+                self.heartbeatActivity = nil
+            }
+            NSApplication.shared.terminate(nil)
+        }
+    }
+
+    private var serviceDirectory: URL {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("mfan-\(NSUserName())")
+        try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        return base
+    }
+
+    private var socketPath: String {
+        // sockaddr_un.sun_path is limited to roughly 104 bytes on macOS.
+        // The per-user temporary directory is already long, so keep the
+        // randomized socket directly under /tmp and pass the full same path
+        // to both the privileged server and this client.
+        "/tmp/mfan-\(serviceID)"
+    }
+
+    private var serviceLogPath: String {
+        serviceDirectory.appendingPathComponent("control-service.log").path
+    }
+
+    private func serviceErrorMessage(_ error: Error) -> String {
+        let logURL = URL(fileURLWithPath: serviceLogPath)
+        if let data = try? Data(contentsOf: logURL),
+           let log = String(data: data, encoding: .utf8),
+           !log.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let tail = String(log.suffix(800)).trimmingCharacters(in: .whitespacesAndNewlines)
+            return "\(error.localizedDescription)\n服务日志：\(tail)"
+        }
+        return "\(error.localizedDescription)\n服务日志路径：\(serviceLogPath)"
+    }
+
+    private func ensureControlClient() async throws -> PrivilegedControlClient {
+        let client = controlClient ?? PrivilegedControlClient(socketPath: socketPath)
+        guard await client.ping() else { throw FanError.controlServiceUnavailable }
+        await startHeartbeat(for: client)
+        return client
+    }
+
+    private func waitForControlClient() async throws -> PrivilegedControlClient {
+        let deadline = ProcessInfo.processInfo.systemUptime + 10
+        while ProcessInfo.processInfo.systemUptime < deadline {
+            let client = PrivilegedControlClient(socketPath: socketPath)
+            if await client.ping() {
+                await startHeartbeat(for: client)
+                return client
+            }
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+        throw FanError.controlServiceUnavailable
+    }
+}
+
+private struct MenuBarLabel: View {
+    @ObservedObject var model: FanModel
+
+    var body: some View {
+        HStack(spacing: 3) {
+            Image(systemName: "fan.fill")
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(iconColor)
+            if let fan = model.fans.first {
+                Text("\(Int(fan.currentRPM))")
+                    .font(.caption.monospacedDigit())
+            }
+        }
+    }
+
+    private var iconColor: Color {
+        guard let fan = model.fans.first else { return .secondary }
+        if fan.currentRPM >= 5_000 { return .red }
+        if fan.currentRPM >= 3_500 { return .orange }
+        return .primary
+    }
+}
+
+private struct FanMenuView: View {
+    @ObservedObject var model: FanModel
+    @AppStorage("startupFanEnabled") private var startupFanEnabled = false
+    @AppStorage("startupFanID") private var startupFanID = 0
+    @AppStorage("startupFanRPM") private var startupFanRPM = 0.0
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Label("MFan", systemImage: "fan.fill")
+                    .font(.headline)
+                Spacer()
+                if model.hasRead && model.readError == nil {
+                    Circle().fill(.green).frame(width: 7, height: 7)
+                }
+            }
+
+            if let error = model.readError {
+                Label(error, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if !model.hasRead {
+                ProgressView("正在读取 SMC…")
+                    .controlSize(.small)
+            } else if model.fans.isEmpty {
+                Text("未检测到风扇")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(model.fans) { fan in
+                    FanMenuRow(
+                        fan: fan,
+                        busy: model.busy,
+                        startupFanID: startupFanID,
+                        set: { rpm, seconds in
+                            model.set(fanID: fan.id, rpm: rpm, seconds: seconds)
+                        },
+                        setStartup: { rpm in
+                            startupFanEnabled = true
+                            startupFanID = fan.id
+                            startupFanRPM = Double(rpm)
+                        }
+                    )
+                }
+            }
+
+            if !model.temperatures.isEmpty {
+                TemperatureSection(temperatures: model.temperatures)
+            }
+
+            if model.busy {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text(model.operation).font(.caption)
+                }
+            }
+
+            if let error = model.controlConnectionError {
+                Label(error, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if let message = model.commandMessage {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(model.commandFailed ? .red : .secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Divider()
+
+            HStack {
+                Button("恢复自动") {
+                    model.restoreAutomatic()
+                }
+                .disabled(model.busy || !FanModel.supportsArchitecture)
+                Spacer()
+                if let date = model.lastRead {
+                    Text(date, style: .time)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            HStack {
+                if startupFanEnabled {
+                    Button("取消启动设定") {
+                        startupFanEnabled = false
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.caption2)
+                } else {
+                    Text("启动设定未启用")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Text("每 5 秒读取")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Button("退出") {
+                    model.quit()
+                }
+                .buttonStyle(.borderless)
+            }
+        }
+        .padding(12)
+        .frame(width: 330)
+        .onAppear { model.refresh() }
+    }
+}
+
+private struct FanMenuRow: View {
+    let fan: FanSnapshot
+    let busy: Bool
+    let startupFanID: Int
+    let set: (Int, Int) -> Void
+    let setStartup: (Int) -> Void
+    @State private var rpm: Double
+    @State private var seconds = 60
+
+    private let rpmStep = 100.0
+
+    init(
+        fan: FanSnapshot,
+        busy: Bool,
+        startupFanID: Int,
+        set: @escaping (Int, Int) -> Void,
+        setStartup: @escaping (Int) -> Void
+    ) {
+        self.fan = fan
+        self.busy = busy
+        self.startupFanID = startupFanID
+        self.set = set
+        self.setStartup = setStartup
+        let initial = fan.targetRPM ?? fan.currentRPM
+        _rpm = State(initialValue: min(floor(fan.maximumRPM), max(ceil(fan.minimumRPM), initial)))
+    }
+
+    private var lower: Double { ceil(fan.minimumRPM) }
+    private var upper: Double { floor(fan.maximumRPM) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack {
+                Text("风扇 #\(fan.id)").font(.subheadline.weight(.medium))
+                Spacer()
+                Text("\(Int(fan.currentRPM)) RPM")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack(spacing: 8) {
+                if lower < upper {
+                    Slider(value: $rpm, in: lower...upper, step: rpmStep)
+                }
+                Text("\(snappedRPM)")
+                    .font(.caption.monospacedDigit())
+                    .frame(width: 48, alignment: .trailing)
+            }
+
+            HStack(spacing: 6) {
+                Picker("期限", selection: $seconds) {
+                    Text("不限时").tag(0)
+                    ForEach(Array(stride(from: 30, through: 600, by: 30)), id: \.self) { value in
+                        Text("\(value) 秒").tag(value)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 88)
+
+                Spacer()
+
+                Button("启动设定") { setStartup(snappedRPM) }
+                    .controlSize(.small)
+                    .disabled(busy)
+                Button("设定") { set(snappedRPM, seconds) }
+                    .controlSize(.small)
+            }
+            if startupFanID == fan.id {
+                Text("已选为启动时设定风扇")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .disabled(busy)
+        .onChange(of: fan.minimumRPM) { _ in clampRPM() }
+        .onChange(of: fan.maximumRPM) { _ in clampRPM() }
+    }
+
+    private var snappedRPM: Int {
+        guard upper >= lower else { return Int(lower.rounded()) }
+        let stepped = lower + (rpm - lower).rounded() / rpmStep * rpmStep
+        return Int(min(upper, max(lower, stepped)).rounded())
+    }
+
+    private func clampRPM() {
+        rpm = min(upper, max(lower, rpm))
+    }
+}
