@@ -49,14 +49,17 @@ do {
             exit(1)
         }
         
-        // 读取当前状态并保存起始转速
         let snap = try client.snapshot(index: index)
-        let originalSpeed = snap.currentRPM
-        
-        // 设定手动转速（不低于当前实际转速，防止手动降速过低）
-        let targetRPM = max(rpm, originalSpeed)
-        if targetRPM > rpm {
-            print("警告：目标转速 \(Int(rpm)) 低于当前实际 \(Int(originalSpeed))，已提升到 \(Int(targetRPM))")
+        guard rpm.isFinite, snap.minimumRPM.isFinite, snap.maximumRPM.isFinite,
+              snap.minimumRPM >= 0, snap.maximumRPM > 0,
+              snap.minimumRPM <= snap.maximumRPM else {
+            print("错误：RPM 或风扇硬件转速范围无效")
+            exit(1)
+        }
+        // Tachometer overshoot is not a target limit; use the hardware range.
+        let targetRPM = min(snap.maximumRPM, max(snap.minimumRPM, rpm))
+        if targetRPM != rpm {
+            print("目标转速已限制到硬件范围内：\(targetRPM) RPM")
         }
         
         let usesManualMode = try client.supportsManualMode(fanIndex: index)

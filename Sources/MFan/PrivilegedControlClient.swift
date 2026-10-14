@@ -27,7 +27,7 @@ final class PrivilegedControlClient: Sendable {
     static func responseTimeout(for request: FanControlRequest) -> TimeInterval {
         switch request.command {
         case "ping", "heartbeat": return 3
-        case "set": return Double(max(0, request.seconds ?? 0)) + 15
+
         default: return 15
         }
     }

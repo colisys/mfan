@@ -6,8 +6,8 @@ import FanCore
 @testable import MFan
 
 final class HeartbeatServerTests: XCTestCase {
-    private func startHarness(manual: Bool, path: String? = nil) async throws -> Harness {
-        let harness = Harness(manual: manual, path: path)
+    private func startHarness(manual: Bool, path: String? = nil, fanCount: Int = 1) async throws -> Harness {
+        let harness = Harness(manual: manual, path: path, fanCount: fanCount)
         addTeardownBlock { await harness.cleanup() }
         harness.start()
         try await harness.waitUntilReady()
@@ -16,8 +16,11 @@ final class HeartbeatServerTests: XCTestCase {
 
     func testTimedSetAcceptsHeartbeatAndRestoresOnTimeout() async throws {
         let harness = try await startHarness(manual: false)
-        let reply = harness.begin(.init(command: "set", fan: 0, rpm: 3_000, seconds: 600))
-        try await harness.waitForWrite()
+        let result = try await harness.send(.init(command: "set", fan: 0, rpm: 3_000, seconds: 600))
+        XCTAssertTrue(result.success)
+        XCTAssertTrue(result.message?.contains("3000") == true)
+        XCTAssertTrue(result.message?.contains("600") == true)
+        XCTAssertEqual(result.minimumRPMs?[0], 2_000)
         harness.clock.set(awake: 50, continuous: 50)
         let alive = try await harness.send(.init(command: "heartbeat"))
         XCTAssertTrue(alive.success)
@@ -25,8 +28,6 @@ final class HeartbeatServerTests: XCTestCase {
         try await harness.pingBarrier()
         XCTAssertEqual(harness.hardware.minimumRestores, 0)
         harness.clock.set(awake: 111, continuous: 111)
-        let result = try await reply.value()
-        XCTAssertFalse(result.success)
         await fulfillment(of: [harness.stopped], timeout: 3)
         XCTAssertEqual(harness.hardware.restoredMinimum, 2_000)
         XCTAssertFalse(FileManager.default.fileExists(atPath: harness.path))
@@ -47,11 +48,11 @@ final class HeartbeatServerTests: XCTestCase {
 
     func testTimedDeadlineIncludesSleepAndShutdownRestoresUnlimited() async throws {
         let harness = try await startHarness(manual: false)
-        let reply = harness.begin(.init(command: "set", fan: 0, rpm: 3_000, seconds: 30))
-        try await harness.waitForWrite()
-        harness.clock.set(awake: 1, continuous: 3_601)
-        let result = try await reply.value()
+        let result = try await harness.send(.init(command: "set", fan: 0, rpm: 3_000, seconds: 30))
         XCTAssertTrue(result.success)
+        XCTAssertEqual(harness.hardware.minimumRestores, 0)
+        harness.clock.set(awake: 1, continuous: 3_601)
+        try await harness.pingBarrier()
         XCTAssertEqual(harness.hardware.restoredMinimum, 2_000)
         let set = try await harness.send(.init(command: "set", fan: 0, rpm: 3_000, seconds: 0))
         XCTAssertTrue(set.success)
@@ -64,11 +65,10 @@ final class HeartbeatServerTests: XCTestCase {
     func testFailedTimedRestoreRetriesOnAwakeTimeAndRejectsSet() async throws {
         let harness = try await startHarness(manual: false)
         harness.hardware.failRestores(1)
-        let reply = harness.begin(.init(command: "set", fan: 0, rpm: 3_000, seconds: 30))
-        try await harness.waitForWrite()
+        let result = try await harness.send(.init(command: "set", fan: 0, rpm: 3_000, seconds: 30))
+        XCTAssertTrue(result.success)
         harness.clock.set(awake: 30, continuous: 30)
-        let result = try await reply.value()
-        XCTAssertFalse(result.success)
+        try await harness.pingBarrier()
         XCTAssertEqual(harness.hardware.restoreAttempts, 1)
 
         let rejected = try await harness.send(.init(command: "set", fan: 0, rpm: 3_000, seconds: 0))
@@ -77,7 +77,11 @@ final class HeartbeatServerTests: XCTestCase {
         // Sleep must not bring the awake-time retry forward.
         harness.clock.set(awake: 34, continuous: 3_634)
         let heartbeat = try await harness.send(.init(command: "heartbeat"))
-        XCTAssertTrue(heartbeat.success)
+        XCTAssertFalse(heartbeat.success)
+        XCTAssertTrue(heartbeat.error?.contains("风扇 0") == true)
+        XCTAssertTrue(heartbeat.error?.contains("等待重试") == true)
+        XCTAssertTrue(heartbeat.error?.contains("injected restore failure") == true)
+        XCTAssertEqual(heartbeat.minimumRPMs?[0], 2_000)
         try await harness.pingBarrier()
         XCTAssertEqual(harness.hardware.restoreAttempts, 1)
         harness.clock.set(awake: 35, continuous: 3_635)
@@ -96,11 +100,10 @@ final class HeartbeatServerTests: XCTestCase {
     func testAutoCanResolveFailedTimedRestoreBeforeRetry() async throws {
         let harness = try await startHarness(manual: true)
         harness.hardware.failRestores(1)
-        let reply = harness.begin(.init(command: "set", fan: 0, rpm: 3_000, seconds: 30))
-        try await harness.waitForWrite()
+        let result = try await harness.send(.init(command: "set", fan: 0, rpm: 3_000, seconds: 30))
+        XCTAssertTrue(result.success)
         harness.clock.set(awake: 30, continuous: 30)
-        let result = try await reply.value()
-        XCTAssertFalse(result.success)
+        try await harness.pingBarrier()
         let auto = try await harness.send(.init(command: "auto", fan: 0))
         XCTAssertTrue(auto.success)
         harness.clock.set(awake: 35, continuous: 35)
@@ -113,11 +116,10 @@ final class HeartbeatServerTests: XCTestCase {
     func testPersistentRestoreFailureStillExitsOnWatchdog() async throws {
         let harness = try await startHarness(manual: false)
         harness.hardware.failRestores(.max)
-        let reply = harness.begin(.init(command: "set", fan: 0, rpm: 3_000, seconds: 30))
-        try await harness.waitForWrite()
+        let result = try await harness.send(.init(command: "set", fan: 0, rpm: 3_000, seconds: 30))
+        XCTAssertTrue(result.success)
         harness.clock.set(awake: 30, continuous: 30)
-        let result = try await reply.value()
-        XCTAssertFalse(result.success)
+        try await harness.pingBarrier()
         harness.clock.set(awake: 35, continuous: 35)
         try await harness.pingBarrier()
         XCTAssertEqual(harness.hardware.restoreAttempts, 2)
@@ -131,6 +133,243 @@ final class HeartbeatServerTests: XCTestCase {
         XCTAssertEqual(harness.hardware.restoreAttempts, 5)
         XCTAssertEqual(harness.hardware.minimumRestores, 0)
         XCTAssertFalse(FileManager.default.fileExists(atPath: harness.path))
+    }
+
+    func testSixHundredSecondSetAllowsImmediateAuto() async throws {
+        for manual in [false, true] {
+            let harness = try await startHarness(manual: manual)
+            let set = try await harness.send(.init(command: "set", fan: 0, rpm: 4_000, seconds: 600))
+            XCTAssertTrue(set.success)
+            let auto = try await harness.send(.init(command: "auto", fan: 0))
+            XCTAssertTrue(auto.success)
+            XCTAssertTrue(auto.minimumRPMs?.isEmpty == true)
+            XCTAssertEqual(harness.hardware.restoreAttempts, 1)
+            harness.clock.set(awake: 1, continuous: 601)
+            try await harness.pingBarrier()
+            XCTAssertEqual(harness.hardware.restoreAttempts, 1)
+        }
+    }
+
+    func testLoweringTemporaryMinimumPreservesOriginalInEveryResponse() async throws {
+        let harness = try await startHarness(manual: false)
+        let first = try await harness.send(.init(command: "set", fan: 0, rpm: 4_000, seconds: 600))
+        XCTAssertTrue(first.success)
+        let lower = try await harness.send(.init(command: "set", fan: 0, rpm: 2_500, seconds: 600))
+        XCTAssertTrue(lower.success)
+        XCTAssertEqual(lower.minimumRPMs?[0], 2_000)
+        XCTAssertEqual(try harness.hardware.snapshot(index: 0).minimumRPM, 2_500)
+        XCTAssertEqual(harness.hardware.raiseCount, 1)
+        XCTAssertEqual(harness.hardware.writtenTargets(), [4_000, 2_500])
+        let ping = try await harness.send(.init(command: "ping"))
+        XCTAssertEqual(ping.minimumRPMs?[0], 2_000)
+        let heartbeat = try await harness.send(.init(command: "heartbeat"))
+        XCTAssertEqual(heartbeat.minimumRPMs?[0], 2_000)
+        let invalid = try await harness.send(.init(command: "unknown"))
+        XCTAssertFalse(invalid.success)
+        XCTAssertEqual(invalid.minimumRPMs?[0], 2_000)
+        let auto = try await harness.send(.init(command: "auto", fan: 0))
+        XCTAssertTrue(auto.success)
+        XCTAssertTrue(auto.minimumRPMs?.isEmpty == true)
+        XCTAssertEqual(harness.hardware.writtenTargets(), [4_000, 2_500, 2_000])
+    }
+
+    func testNewTimedSetReplacesOnlyItsDeadline() async throws {
+        let harness = try await startHarness(manual: false)
+        let first = try await harness.send(.init(command: "set", fan: 0, rpm: 4_000, seconds: 30))
+        XCTAssertTrue(first.success)
+        harness.clock.set(awake: 10, continuous: 10)
+        let second = try await harness.send(.init(command: "set", fan: 0, rpm: 3_000, seconds: 30))
+        XCTAssertTrue(second.success)
+        harness.clock.set(awake: 30, continuous: 30)
+        try await harness.pingBarrier()
+        XCTAssertEqual(harness.hardware.writtenTargets(), [4_000, 3_000])
+        harness.clock.set(awake: 40, continuous: 40)
+        try await harness.pingBarrier()
+        XCTAssertEqual(harness.hardware.writtenTargets(), [4_000, 3_000, 2_000])
+    }
+
+    func testReplacementCanShortenDeadline() async throws {
+        let harness = try await startHarness(manual: true)
+        let first = try await harness.send(.init(command: "set", fan: 0, rpm: 4_000, seconds: 600))
+        XCTAssertTrue(first.success)
+        let shorter = try await harness.send(.init(command: "set", fan: 0, rpm: 3_000, seconds: 30))
+        XCTAssertTrue(shorter.success)
+        harness.clock.set(awake: 30, continuous: 30)
+        try await harness.pingBarrier()
+        XCTAssertEqual(harness.hardware.autoRestores, 1)
+        harness.clock.set(awake: 31, continuous: 601)
+        try await harness.pingBarrier()
+        XCTAssertEqual(harness.hardware.autoRestores, 1)
+    }
+
+    func testAutoAllClearsEveryTimedFan() async throws {
+        let harness = try await startHarness(manual: false, fanCount: 2)
+        for fan in 0..<2 {
+            let set = try await harness.send(.init(command: "set", fan: fan, rpm: 3_000, seconds: 600))
+            XCTAssertTrue(set.success)
+        }
+        let auto = try await harness.send(.init(command: "auto"))
+        XCTAssertTrue(auto.success)
+        XCTAssertTrue(auto.minimumRPMs?.isEmpty == true)
+        XCTAssertEqual(harness.hardware.minimumRestores, 2)
+        harness.clock.set(awake: 1, continuous: 601)
+        try await harness.pingBarrier()
+        XCTAssertEqual(harness.hardware.minimumRestores, 2)
+    }
+
+    func testUnlimitedSetCancelsPreviousDeadline() async throws {
+        let harness = try await startHarness(manual: false)
+        let first = try await harness.send(.init(command: "set", fan: 0, rpm: 4_000, seconds: 30))
+        XCTAssertTrue(first.success)
+        let unlimited = try await harness.send(.init(command: "set", fan: 0, rpm: 3_000, seconds: 0))
+        XCTAssertTrue(unlimited.success)
+        XCTAssertTrue(unlimited.message?.contains("不限时") == true)
+        harness.clock.set(awake: 30, continuous: 30)
+        try await harness.pingBarrier()
+        XCTAssertEqual(harness.hardware.writtenTargets(), [4_000, 3_000])
+        let auto = try await harness.send(.init(command: "auto", fan: 0))
+        XCTAssertTrue(auto.success)
+        XCTAssertEqual(harness.hardware.restoredMinimum, 2_000)
+    }
+
+    func testMultipleFansHaveIndependentDeadlinesAndAuto() async throws {
+        let harness = try await startHarness(manual: false, fanCount: 2)
+        let first = try await harness.send(.init(command: "set", fan: 0, rpm: 4_000, seconds: 30))
+        XCTAssertTrue(first.success)
+        let second = try await harness.send(.init(command: "set", fan: 1, rpm: 3_500, seconds: 40))
+        XCTAssertTrue(second.success)
+        XCTAssertEqual(second.minimumRPMs, [0: 2_000, 1: 2_000])
+        let auto = try await harness.send(.init(command: "auto", fan: 0))
+        XCTAssertTrue(auto.success)
+        XCTAssertEqual(auto.minimumRPMs, [1: 2_000])
+        let replacement = try await harness.send(.init(command: "set", fan: 0, rpm: 3_000, seconds: 0))
+        XCTAssertTrue(replacement.success)
+        harness.clock.set(awake: 30, continuous: 30)
+        try await harness.pingBarrier()
+        XCTAssertEqual(harness.hardware.writtenTargets(fan: 0), [4_000, 2_000, 3_000])
+        XCTAssertEqual(harness.hardware.writtenTargets(fan: 1), [3_500])
+        harness.clock.set(awake: 40, continuous: 40)
+        let heartbeat = try await harness.send(.init(command: "heartbeat"))
+        XCTAssertTrue(heartbeat.success)
+        XCTAssertEqual(heartbeat.minimumRPMs, [0: 2_000])
+        XCTAssertEqual(harness.hardware.writtenTargets(fan: 1), [3_500, 2_000])
+        XCTAssertEqual(try harness.hardware.snapshot(index: 0).minimumRPM, 3_000)
+    }
+
+    func testRequestsClampWithoutUsingCurrentRPM() async throws {
+        for manual in [false, true] {
+            let harness = try await startHarness(manual: manual)
+            harness.hardware.configure(current: 7_000)
+            for (requested, target) in [(3_000.0, 3_000.0), (9_000, 6_000), (-100, 2_000)] {
+                let response = try await harness.send(.init(command: "set", fan: 0, rpm: requested, seconds: 0))
+                XCTAssertTrue(response.success)
+                XCTAssertTrue(response.message?.contains("\(target)") == true)
+            }
+            XCTAssertEqual(harness.hardware.writtenTargets(), [3_000, 6_000, 2_000])
+            if !manual { XCTAssertEqual(harness.hardware.raiseCount, 1) }
+        }
+    }
+
+    func testInvalidHardwareBoundsAreRejectedBeforeWriting() async throws {
+        let harness = try await startHarness(manual: false)
+        let bounds: [(Double, Double)] = [(.nan, 6_000), (2_000, .infinity),
+                                          (-1, 6_000), (2_000, 1_000), (0, 0)]
+        for (minimum, maximum) in bounds {
+            harness.hardware.configure(minimum: minimum, maximum: maximum)
+            let response = try await harness.send(.init(command: "set", fan: 0, rpm: 3_000, seconds: 0))
+            XCTAssertFalse(response.success)
+            XCTAssertTrue(response.minimumRPMs?.isEmpty == true)
+        }
+        XCTAssertEqual(harness.hardware.writeCount, 0)
+    }
+
+    func testFailedReplacementPreservesOriginalMinimumAndDeadline() async throws {
+        let harness = try await startHarness(manual: false)
+        let first = try await harness.send(.init(command: "set", fan: 0, rpm: 4_000, seconds: 30))
+        XCTAssertTrue(first.success)
+        harness.clock.set(awake: 10, continuous: 10)
+        harness.hardware.failWrites(1)
+        let failed = try await harness.send(.init(command: "set", fan: 0, rpm: 3_000, seconds: 0))
+        XCTAssertFalse(failed.success)
+        XCTAssertEqual(failed.minimumRPMs?[0], 2_000)
+        harness.clock.set(awake: 15, continuous: 15)
+        try await harness.pingBarrier()
+        XCTAssertEqual(harness.hardware.writtenTargets(), [4_000, 3_000])
+        harness.clock.set(awake: 30, continuous: 30)
+        try await harness.pingBarrier()
+        XCTAssertEqual(harness.hardware.writtenTargets(), [4_000, 3_000, 2_000])
+    }
+
+    func testPartialFirstWriteSchedulesRecoveryWithoutInstallingDeadline() async throws {
+        for manual in [false, true] {
+            let harness = try await startHarness(manual: manual)
+            harness.hardware.failWrites(1)
+            let failed = try await harness.send(.init(command: "set", fan: 0, rpm: 4_000, seconds: 600))
+            XCTAssertFalse(failed.success)
+            let heartbeat = try await harness.send(.init(command: "heartbeat"))
+            XCTAssertFalse(heartbeat.success)
+            XCTAssertTrue(heartbeat.error?.contains("injected partial write failure") == true)
+            harness.clock.set(awake: 5, continuous: 5)
+            let recovered = try await harness.send(.init(command: "heartbeat"))
+            XCTAssertTrue(recovered.success)
+            XCTAssertTrue(recovered.minimumRPMs?.isEmpty == true)
+            XCTAssertEqual(harness.hardware.restoreAttempts, 1)
+            harness.clock.set(awake: 6, continuous: 601)
+            try await harness.pingBarrier()
+            XCTAssertEqual(harness.hardware.restoreAttempts, 1)
+            if !manual { XCTAssertEqual(harness.hardware.restoredMinimum, 2_000) }
+        }
+    }
+
+    func testFailedUnlimitedReplacementRetriesOriginalMinimum() async throws {
+        let harness = try await startHarness(manual: false)
+        let first = try await harness.send(.init(command: "set", fan: 0, rpm: 4_000, seconds: 0))
+        XCTAssertTrue(first.success)
+        harness.hardware.failWrites(1)
+        let failed = try await harness.send(.init(command: "set", fan: 0, rpm: 3_000, seconds: 600))
+        XCTAssertFalse(failed.success)
+        XCTAssertEqual(failed.minimumRPMs?[0], 2_000)
+        harness.clock.set(awake: 5, continuous: 5)
+        try await harness.pingBarrier()
+        XCTAssertEqual(harness.hardware.writtenTargets(), [4_000, 3_000, 2_000])
+    }
+
+    func testFailedAutoCanBeRetriedImmediatelyAndCancelsDeadline() async throws {
+        let harness = try await startHarness(manual: false)
+        let set = try await harness.send(.init(command: "set", fan: 0, rpm: 4_000, seconds: 600))
+        XCTAssertTrue(set.success)
+        harness.hardware.failRestores(1)
+        let failed = try await harness.send(.init(command: "auto", fan: 0))
+        XCTAssertFalse(failed.success)
+        XCTAssertEqual(failed.minimumRPMs?[0], 2_000)
+        let heartbeat = try await harness.send(.init(command: "heartbeat"))
+        XCTAssertFalse(heartbeat.success)
+        let auto = try await harness.send(.init(command: "auto", fan: 0))
+        XCTAssertTrue(auto.success)
+        harness.clock.set(awake: 5, continuous: 605)
+        let recovered = try await harness.send(.init(command: "heartbeat"))
+        XCTAssertTrue(recovered.success)
+        XCTAssertEqual(harness.hardware.restoreAttempts, 2)
+    }
+
+    func testFailedRecoveryDoesNotBlockAnotherFanAndHeartbeatStillRenewsLease() async throws {
+        let harness = try await startHarness(manual: true, fanCount: 2)
+        let first = try await harness.send(.init(command: "set", fan: 0, rpm: 4_000, seconds: 30))
+        XCTAssertTrue(first.success)
+        harness.hardware.failRestores(.max)
+        harness.clock.set(awake: 30, continuous: 30)
+        let failedHeartbeat = try await harness.send(.init(command: "heartbeat"))
+        XCTAssertFalse(failedHeartbeat.success)
+        let other = try await harness.send(.init(command: "set", fan: 1, rpm: 3_000, seconds: 0))
+        XCTAssertTrue(other.success)
+        let lower = try await harness.send(.init(command: "set", fan: 1, rpm: 2_500, seconds: 0))
+        XCTAssertTrue(lower.success)
+        XCTAssertEqual(harness.hardware.writtenTargets(fan: 1), [3_000, 2_500])
+        harness.clock.set(awake: 61, continuous: 61)
+        try await harness.pingBarrier()
+        // The failed heartbeat at 30 renewed the lease beyond the initial 60.
+        harness.clock.set(awake: 91, continuous: 91)
+        await fulfillment(of: [harness.stopped], timeout: 3)
     }
 
     func testExistingSocketIsNotRemovedOnBindFailure() async throws {
@@ -185,53 +424,95 @@ private final class Clock {
 private final class Hardware: ServiceFanHardware {
     let manual: Bool
     private let lock = NSLock()
+    private var snapshots: [FanSnapshot]
+    private var targets: [Int: [Double]] = [:]
+    private var raises = 0
     private var writes = 0
     private var autos = 0
     private var minimums = 0
     private var attempts = 0
     private var failuresRemaining = 0
+    private var writeFailuresRemaining = 0
     private var restored: Double?
-    init(manual: Bool) { self.manual = manual }
+    init(manual: Bool, fanCount: Int = 1) {
+        self.manual = manual
+        snapshots = (0..<fanCount).map {
+            .init(id: $0, currentRPM: 2_000, minimumRPM: 2_000, maximumRPM: 6_000)
+        }
+    }
     var writeCount: Int { lock.lock(); defer { lock.unlock() }; return writes }
+    var raiseCount: Int { lock.lock(); defer { lock.unlock() }; return raises }
     var autoRestores: Int { lock.lock(); defer { lock.unlock() }; return autos }
     var minimumRestores: Int { lock.lock(); defer { lock.unlock() }; return minimums }
     var restoreAttempts: Int { lock.lock(); defer { lock.unlock() }; return attempts }
     var restoredMinimum: Double? { lock.lock(); defer { lock.unlock() }; return restored }
+    func writtenTargets(fan: Int = 0) -> [Double] {
+        lock.lock(); defer { lock.unlock() }; return targets[fan, default: []]
+    }
+    func configure(fan: Int = 0, current: Double = 2_000, minimum: Double = 2_000, maximum: Double = 6_000) {
+        lock.lock(); defer { lock.unlock() }
+        snapshots[fan] = .init(id: fan, currentRPM: current, minimumRPM: minimum, maximumRPM: maximum)
+    }
     func failRestores(_ count: Int) { lock.lock(); defer { lock.unlock() }; failuresRemaining = count }
-    func fanCount() throws -> Int { 1 }
+    func failWrites(_ count: Int) { lock.lock(); defer { lock.unlock() }; writeFailuresRemaining = count }
+    func fanCount() throws -> Int { lock.lock(); defer { lock.unlock() }; return snapshots.count }
     func snapshot(index: Int) throws -> FanSnapshot {
-        .init(id: 0, currentRPM: 2_000, minimumRPM: 2_000, maximumRPM: 6_000)
+        lock.lock(); defer { lock.unlock() }
+        guard snapshots.indices.contains(index) else { throw NSError(domain: "invalid fan", code: 1) }
+        return snapshots[index]
     }
     func supportsManualMode(fanIndex: Int) throws -> Bool { manual }
     func setManualSpeed(fanIndex: Int, rpm: Double) throws {
-        lock.lock(); defer { lock.unlock() }; writes += 1
+        lock.lock(); defer { lock.unlock() }
+        snapshots[fanIndex].targetRPM = rpm
+        try recordWrite(fan: fanIndex, rpm: rpm)
     }
     func raiseMinimumSpeed(fanIndex: Int, rpm: Double) throws -> Double {
-        lock.lock(); defer { lock.unlock() }; writes += 1; return 2_000
+        lock.lock(); defer { lock.unlock() }
+        raises += 1
+        let original = snapshots[fanIndex].minimumRPM
+        let target = max(original, rpm)
+        snapshots[fanIndex].minimumRPM = target
+        try recordWrite(fan: fanIndex, rpm: target)
+        return original
     }
     func restoreMinimumSpeed(fanIndex: Int, rpm: Double) throws {
         lock.lock(); defer { lock.unlock() }
         try attemptRestore()
+        snapshots[fanIndex].minimumRPM = rpm
+        try recordWrite(fan: fanIndex, rpm: rpm)
         restored = rpm
         minimums += 1
     }
     func restoreAuto(fanIndex: Int) throws {
         lock.lock(); defer { lock.unlock() }
         try attemptRestore()
+        snapshots[fanIndex].targetRPM = nil
         autos += 1
+    }
+    // Fail after mutation to simulate a hardware write that only partly succeeded.
+    private func recordWrite(fan: Int, rpm: Double) throws {
+        writes += 1
+        targets[fan, default: []].append(rpm)
+        if writeFailuresRemaining > 0 {
+            writeFailuresRemaining -= 1
+            throw NSError(domain: "test hardware", code: 2,
+                          userInfo: [NSLocalizedDescriptionKey: "injected partial write failure"])
+        }
     }
     // Called with the hardware lock held.
     private func attemptRestore() throws {
         attempts += 1
         if failuresRemaining > 0 {
             failuresRemaining -= 1
-            throw NSError(domain: "injected restore failure", code: 1)
+            throw NSError(domain: "test hardware", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "injected restore failure"])
         }
     }
 }
 
-// Do not await a timed-set Task.value directly: the production client's deadline
-// may be 615 seconds and cancellation does not interrupt its detached socket I/O.
+// Bound every response wait so a regression to blocking timed sets fails quickly,
+// even if cancellation does not interrupt the client's detached socket I/O.
 private final class Reply {
     private let lock = NSLock()
     private var result: Result<FanControlResponse, Error>?
@@ -264,9 +545,9 @@ private final class Harness {
     private let lock = NSLock()
     private var didStop = false
     var control: PrivilegedControlClient { .init(socketPath: path) }
-    init(manual: Bool, path: String? = nil) {
+    init(manual: Bool, path: String? = nil, fanCount: Int = 1) {
         self.path = path ?? "/tmp/mfan-test-\(UUID().uuidString)"
-        hardware = Hardware(manual: manual)
+        hardware = Hardware(manual: manual, fanCount: fanCount)
     }
     private func markStopped() { lock.lock(); defer { lock.unlock() }; didStop = true }
     private func isStopped() -> Bool { lock.lock(); defer { lock.unlock() }; return didStop }
@@ -295,17 +576,7 @@ private final class Harness {
         }
         throw NSError(domain: "test startup", code: 1)
     }
-    func waitForWrite() async throws {
-        for _ in 0..<50 {
-            if hardware.writeCount > 0 {
-                // A reply from the serial request loop proves pending was installed.
-                try await pingBarrier()
-                return
-            }
-            try await Task.sleep(nanoseconds: 20_000_000)
-        }
-        throw NSError(domain: "test write", code: 1)
-    }
+
     func cleanup() async {
         guard !isStopped() else { return }
         hardware.failRestores(0)

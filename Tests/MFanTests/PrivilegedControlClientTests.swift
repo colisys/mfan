@@ -8,8 +8,8 @@ final class PrivilegedControlClientTests: XCTestCase {
     func testTimeoutBudgets() {
         XCTAssertEqual(PrivilegedControlClient.responseTimeout(for: FanControlRequest(command: "heartbeat")), 3)
         XCTAssertEqual(PrivilegedControlClient.responseTimeout(for: FanControlRequest(command: "ping")), 3)
-        XCTAssertEqual(PrivilegedControlClient.responseTimeout(for: FanControlRequest(command: "set", seconds: 30)), 45)
-        XCTAssertEqual(PrivilegedControlClient.responseTimeout(for: FanControlRequest(command: "set", seconds: 600)), 615)
+        XCTAssertEqual(PrivilegedControlClient.responseTimeout(for: FanControlRequest(command: "set", seconds: 30)), 15)
+        XCTAssertEqual(PrivilegedControlClient.responseTimeout(for: FanControlRequest(command: "set", seconds: 600)), 15)
         XCTAssertEqual(PrivilegedControlClient.responseTimeout(for: FanControlRequest(command: "set", seconds: 0)), 15)
     }
 

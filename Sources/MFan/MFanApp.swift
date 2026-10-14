@@ -74,6 +74,7 @@ private final class FanModel: ObservableObject {
     @Published private(set) var commandMessage: String?
     @Published private(set) var commandFailed = false
     @Published private(set) var controlConnectionError: String?
+    @Published private var controlMinimums: [Int: Double] = [:]
 
     private let readQueue = DispatchQueue(label: "MFan.SMC.read", qos: .utility)
     private let commands = CommandRunner()
@@ -88,6 +89,9 @@ private final class FanModel: ObservableObject {
     private var heartbeatTask: Task<Void, Never>?
     private var heartbeatPending = false
     private var wakeObserver: NSObjectProtocol?
+
+    static let defaultRefreshInterval: TimeInterval = 5
+    static let refreshIntervals: [TimeInterval] = [3, 5, 10, 15, 30]
 
     static var supportsArchitecture: Bool {
         #if arch(x86_64)
@@ -109,7 +113,8 @@ private final class FanModel: ObservableObject {
 
         refresh()
         let timer = DispatchSource.makeTimerSource(queue: readQueue)
-        timer.schedule(deadline: .now() + 5, repeating: 5, leeway: .milliseconds(250))
+        timer.schedule(deadline: .now() + Self.defaultRefreshInterval,
+                       repeating: Self.defaultRefreshInterval, leeway: .milliseconds(250))
         timer.setEventHandler { [weak self] in
             Task { @MainActor [weak self] in self?.refresh() }
         }
@@ -137,6 +142,13 @@ private final class FanModel: ObservableObject {
         var value: Int32 = 0
         var size = MemoryLayout<Int32>.size
         return sysctlbyname("sysctl.proc_translated", &value, &size, nil, 0) == 0 && value == 1
+    }
+
+    func setRefreshInterval(_ interval: TimeInterval) {
+        guard Self.refreshIntervals.contains(interval), let timer else { return }
+        timer.schedule(deadline: .now() + interval,
+                       repeating: interval, leeway: .milliseconds(250))
+        refresh()
     }
 
     func refresh() {
@@ -167,12 +179,21 @@ private final class FanModel: ObservableObject {
         }
     }
 
+    func controlSnapshot(_ fan: FanSnapshot) -> FanSnapshot {
+        var result = fan
+        if let minimum = controlMinimums[fan.id], minimum.isFinite,
+           minimum >= 0, ceil(minimum) <= floor(fan.maximumRPM) {
+            result.minimumRPM = minimum
+        }
+        return result
+    }
+
     func set(fanID: Int, rpm: Int, seconds: Int) {
         guard !busy, readError == nil,
-              let fan = fans.first(where: { $0.id == fanID }),
-              Double(rpm) >= ceil(fan.minimumRPM),
-              Double(rpm) <= floor(fan.maximumRPM),
+              let snapshot = fans.first(where: { $0.id == fanID }),
               seconds == 0 || (30...600).contains(seconds) else { return }
+        let fan = controlSnapshot(snapshot)
+        let rpm = Int(min(floor(fan.maximumRPM), max(ceil(fan.minimumRPM), Double(rpm))))
 
         execute(
             request: FanControlRequest(command: "set", fan: fanID, rpm: Double(rpm), seconds: seconds),
@@ -187,7 +208,8 @@ private final class FanModel: ObservableObject {
               UserDefaults.standard.bool(forKey: "startupFanEnabled"),
               let fan = fans.first(where: { $0.id == UserDefaults.standard.integer(forKey: "startupFanID") }) else { return }
         let configuredRPM = UserDefaults.standard.double(forKey: "startupFanRPM")
-        let rpm = Int(min(fan.maximumRPM, max(fan.minimumRPM, configuredRPM)))
+        guard configuredRPM.isFinite else { return }
+        let rpm = Int(min(floor(fan.maximumRPM), max(ceil(fan.minimumRPM), configuredRPM)))
         guard rpm > 0 else { return }
         startupSettingAttempted = true
         set(fanID: fan.id, rpm: rpm, seconds: 0)
@@ -227,6 +249,10 @@ private final class FanModel: ObservableObject {
             let failure: String?
             do {
                 let response = try await client.send(FanControlRequest(command: "heartbeat"))
+                if let self, self.controlClient === client, !self.busy,
+                   let minima = response.minimumRPMs {
+                    self.controlMinimums = minima
+                }
                 failure = response.success ? nil : (response.error ?? "控制服务拒绝心跳")
             } catch {
                 failure = error.localizedDescription
@@ -235,7 +261,7 @@ private final class FanModel: ObservableObject {
             self.heartbeatTask = nil
             if self.controlClient === client {
                 self.controlConnectionError = failure.map {
-                    "控制服务心跳丢失，无法确认手动控制仍有效：\($0)"
+                    "控制服务状态异常：\($0)"
                 }
             }
             if self.heartbeatPending {
@@ -310,6 +336,7 @@ private final class FanModel: ObservableObject {
                         "控制请求结果未知，未自动重试：\(error.localizedDescription)"
                     )
                 }
+                if let minima = response.minimumRPMs { self.controlMinimums = minima }
                 self.commandFailed = !response.success
                 self.commandMessage = response.success
                     ? (response.message ?? "操作已完成")
@@ -415,6 +442,7 @@ private struct FanMenuView: View {
     @AppStorage("startupFanEnabled") private var startupFanEnabled = false
     @AppStorage("startupFanID") private var startupFanID = 0
     @AppStorage("startupFanRPM") private var startupFanRPM = 0.0
+    @AppStorage("refreshInterval") private var refreshInterval = FanModel.defaultRefreshInterval
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -442,7 +470,7 @@ private struct FanMenuView: View {
             } else {
                 ForEach(model.fans) { fan in
                     FanMenuRow(
-                        fan: fan,
+                        fan: model.controlSnapshot(fan),
                         busy: model.busy,
                         startupFanID: startupFanID,
                         set: { rpm, seconds in
@@ -510,9 +538,17 @@ private struct FanMenuView: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                Text("每 5 秒读取")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                Picker("刷新间隔", selection: $refreshInterval) {
+                    ForEach(FanModel.refreshIntervals, id: \.self) { interval in
+                        Text("每 \(Int(interval)) 秒").tag(interval)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 92)
+                .help("风扇与温度读取间隔")
+                .onChange(of: refreshInterval) { interval in
+                    model.setRefreshInterval(interval)
+                }
                 Button("退出") {
                     model.quit()
                 }
@@ -605,7 +641,7 @@ private struct FanMenuRow: View {
 
     private var snappedRPM: Int {
         guard upper >= lower else { return Int(lower.rounded()) }
-        let stepped = lower + (rpm - lower).rounded() / rpmStep * rpmStep
+        let stepped = lower + ((rpm - lower) / rpmStep).rounded() * rpmStep
         return Int(min(upper, max(lower, stepped)).rounded())
     }
 

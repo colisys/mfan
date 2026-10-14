@@ -24,8 +24,8 @@ final class PrivilegedFanServer {
     private var peers: [Int32: Peer] = [:]
     private var restores: [Int: Restore] = [:]
     // Recovery retries own no reply FD and use awake time, independently of timed sets.
-    private var restoreRetries: [Int: TimeInterval] = [:]
-    private var pending: PendingSet?
+    private var restoreRetries: [Int: RestoreRetry] = [:]
+    private var deadlines: [Int: TimeInterval] = [:]
 
     private struct Peer {
         var data = Data()
@@ -35,10 +35,9 @@ final class PrivilegedFanServer {
         case automatic
         case minimum(Double)
     }
-    private struct PendingSet {
-        let fan: Int
-        let fd: Int32
+    private struct RestoreRetry {
         let deadline: TimeInterval
+        let error: String
     }
 
     init(socketPath: String) throws {
@@ -60,7 +59,6 @@ final class PrivilegedFanServer {
             // Always attempt remaining recovery on exit, including poll failures.
             // Watchdog/shutdown failures get a final attempt here and are logged.
             for error in restoreAll() { log(error) }
-            if let pending { close(pending.fd) }
             for fd in peers.keys { close(fd) }
             close(serverFD)
             cleanupSocket()
@@ -72,28 +70,17 @@ final class PrivilegedFanServer {
                 log("面板心跳超时（60 秒清醒时间）；恢复风扇并退出")
                 let errors = restoreAll()
                 errors.forEach(log)
-                if let operation = pending {
-                    respond(.init(success: false, error: "面板心跳超时，已尝试恢复风扇。" + errors.joined(separator: "; ")), fd: operation.fd)
-                    pending = nil
-                }
                 return
             }
-            if let operation = pending, now.continuous >= operation.deadline {
-                do {
-                    try restoreFan(operation.fan)
-                    respond(.init(success: true, message: "限时会话已结束，风扇 \(operation.fan) 已恢复"), fd: operation.fd)
-                } catch {
-                    restoreRetries[operation.fan] = clock().awake + 5
-                    log("限时恢复失败：\(error.localizedDescription)")
-                    respond(.init(success: false, error: error.localizedDescription), fd: operation.fd)
+            // Continuous time includes sleep; recovery never holds a request FD.
+            for fan in Array(deadlines.keys).sorted() where deadlines[fan]! <= now.continuous {
+                deadlines.removeValue(forKey: fan)
+                do { try restoreFan(fan) } catch {
+                    log("风扇 \(fan) 限时恢复失败：\(error.localizedDescription)")
                 }
-                pending = nil
             }
-            for fan in Array(restoreRetries.keys).sorted() where restoreRetries[fan]! <= now.awake {
-                do {
-                    try restoreFan(fan)
-                } catch {
-                    restoreRetries[fan] = clock().awake + 5
+            for fan in Array(restoreRetries.keys).sorted() where restoreRetries[fan]!.deadline <= now.awake {
+                do { try restoreFan(fan) } catch {
                     log("风扇 \(fan) 恢复重试失败：\(error.localizedDescription)")
                 }
             }
@@ -132,7 +119,7 @@ final class PrivilegedFanServer {
     }
 
     /// Incremental, bounded reads keep a silent/partial client from blocking the
-    /// watchdog. Timed sets keep only their reply FD, not the request loop.
+    /// watchdog. Timed sets are acknowledged immediately and restored in the loop.
     private func readPeer(_ fd: Int32) throws -> Bool {
         guard var peer = peers[fd] else { return false }
         var buffer = [UInt8](repeating: 0, count: 4096)
@@ -159,22 +146,21 @@ final class PrivilegedFanServer {
             switch request.command {
             case "heartbeat":
                 lease.receiveHeartbeat(now: clock())
-                respond(.init(success: true, message: "alive"), fd: fd)
+                let errors = restoreRetries.keys.sorted().map {
+                    "风扇 \($0) 恢复失败，等待重试：\(restoreRetries[$0]!.error)"
+                }
+                respond(.init(success: errors.isEmpty, message: errors.isEmpty ? "alive" : nil,
+                              error: errors.isEmpty ? nil : errors.joined(separator: "; ")), fd: fd)
             case "ping":
                 respond(.init(success: true, message: "ready"), fd: fd)
             case "shutdown":
                 let errors = restoreAll()
                 errors.forEach(log)
-                if let operation = pending {
-                    respond(.init(success: false, error: "应用退出，会话结束；已尝试恢复风扇"), fd: operation.fd)
-                    pending = nil
-                }
                 respond(.init(success: errors.isEmpty, message: errors.isEmpty ? "stopped" : nil,
                               error: errors.isEmpty ? nil : errors.joined(separator: "; ")), fd: fd)
                 // Do not claim shutdown succeeded if restoring hardware failed.
                 return errors.isEmpty
             case "auto":
-                guard pending == nil else { throw serviceError("限时会话仍在执行") }
                 if let fan = request.fan {
                     try restoreFan(fan)
                 } else {
@@ -186,18 +172,17 @@ final class PrivilegedFanServer {
                 }
                 respond(.init(success: true, message: "恢复请求已完成"), fd: fd)
             case "set":
-                guard pending == nil else { throw serviceError("限时会话仍在执行") }
-                guard restoreRetries.isEmpty else { throw serviceError("风扇恢复尚未完成，请先恢复或稍后重试") }
                 guard let fan = request.fan, let rpm = request.rpm, let seconds = request.seconds,
                       seconds == 0 || (30...600).contains(seconds) else { throw serviceError("set 参数无效") }
-                try setFan(fan, rpm: rpm)
+                guard restoreRetries[fan] == nil else { throw serviceError("风扇 \(fan) 恢复尚未完成，请先恢复或稍后重试") }
+                let target = try setFan(fan, rpm: rpm)
                 if seconds == 0 {
-                    respond(.init(success: true, message: "风扇 \(fan) 已设定为不限时；心跳失联后恢复"), fd: fd)
+                    deadlines.removeValue(forKey: fan)
                 } else {
-                    // Continuous time includes sleep: an expired timed control
-                    // is restored on wake, but sleep alone never expires heartbeat.
-                    pending = PendingSet(fan: fan, fd: fd, deadline: clock().continuous + Double(seconds))
+                    deadlines[fan] = clock().continuous + Double(seconds)
                 }
+                let duration = seconds == 0 ? "不限时；心跳失联后恢复" : "\(seconds) 秒后恢复"
+                respond(.init(success: true, message: "风扇 \(fan) 已设定为 \(target) RPM，\(duration)"), fd: fd)
             default:
                 throw serviceError("不支持的命令")
             }
@@ -207,30 +192,62 @@ final class PrivilegedFanServer {
         return false
     }
 
-    private func setFan(_ fan: Int, rpm: Double) throws {
+    private func setFan(_ fan: Int, rpm: Double) throws -> Double {
         let snapshot = try client.snapshot(index: fan)
-        guard rpm.isFinite, rpm >= snapshot.minimumRPM, rpm <= snapshot.maximumRPM else {
-            throw serviceError("RPM 超出风扇允许范围")
-        }
-        let target = max(rpm, snapshot.currentRPM)
-        guard target <= snapshot.maximumRPM else { throw serviceError("当前转速超过允许范围") }
-        // Record recovery before the first write (manual mode may be written
-        // successfully even if the following target-speed write fails).
-        if try client.supportsManualMode(fanIndex: fan) {
-            if restores[fan] == nil { restores[fan] = .automatic }
-            try client.setManualSpeed(fanIndex: fan, rpm: target)
+        let original = restores[fan]
+        let minimum: Double
+        if case .minimum(let saved) = original {
+            minimum = saved
         } else {
-            if restores[fan] == nil { restores[fan] = .minimum(snapshot.minimumRPM) }
-            _ = try client.raiseMinimumSpeed(fanIndex: fan, rpm: target)
+            minimum = snapshot.minimumRPM
         }
+        guard rpm.isFinite, snapshot.minimumRPM.isFinite, snapshot.maximumRPM.isFinite,
+              snapshot.minimumRPM >= 0, snapshot.maximumRPM > 0,
+              snapshot.minimumRPM <= snapshot.maximumRPM,
+              minimum.isFinite, minimum >= 0, minimum <= snapshot.maximumRPM else {
+            throw serviceError("RPM 或风扇硬件转速范围无效")
+        }
+        let target = min(max(rpm, minimum), snapshot.maximumRPM)
+        let manual = try client.supportsManualMode(fanIndex: fan)
+        // Record recovery before any potentially partial write, without replacing
+        // the original minimum with a temporary minimum from a previous set.
+        if original == nil {
+            restores[fan] = manual ? .automatic : .minimum(snapshot.minimumRPM)
+        }
+        do {
+            if case .minimum = original {
+                try client.restoreMinimumSpeed(fanIndex: fan, rpm: target)
+            } else if manual {
+                try client.setManualSpeed(fanIndex: fan, rpm: target)
+            } else {
+                _ = try client.raiseMinimumSpeed(fanIndex: fan, rpm: target)
+            }
+        } catch {
+            // A failed replacement keeps its previous deadline. Unlimited/first
+            // writes need a recovery retry because the hardware may have changed.
+            if deadlines[fan] == nil { scheduleRestoreRetry(fan, error: error) }
+            throw error
+        }
+        return target
+    }
+
+    private func scheduleRestoreRetry(_ fan: Int, error: Error) {
+        restoreRetries[fan] = RestoreRetry(deadline: clock().awake + 5, error: error.localizedDescription)
     }
 
     private func restoreFan(_ fan: Int) throws {
-        switch restores[fan] {
-        case .minimum(let original): try client.restoreMinimumSpeed(fanIndex: fan, rpm: original)
-        default: try client.restoreAuto(fanIndex: fan)
+        do {
+            switch restores[fan] {
+            case .minimum(let original): try client.restoreMinimumSpeed(fanIndex: fan, rpm: original)
+            default: try client.restoreAuto(fanIndex: fan)
+            }
+        } catch {
+            if restores[fan] == nil { restores[fan] = .automatic }
+            scheduleRestoreRetry(fan, error: error)
+            throw error
         }
         restores.removeValue(forKey: fan)
+        deadlines.removeValue(forKey: fan)
         restoreRetries.removeValue(forKey: fan)
     }
 
@@ -297,6 +314,12 @@ final class PrivilegedFanServer {
 
     private func respond(_ response: FanControlResponse, fd: Int32) {
         defer { close(fd) }
+        let minimumRPMs = restores.compactMapValues { restore -> Double? in
+            if case .minimum(let original) = restore { return original }
+            return nil
+        }
+        let response = FanControlResponse(success: response.success, message: response.message,
+                                          error: response.error, minimumRPMs: minimumRPMs)
         guard var data = try? JSONEncoder().encode(response) else { return }
         data.append(10)
         // Replies are small, but handle short writes without ever blocking the watchdog.
