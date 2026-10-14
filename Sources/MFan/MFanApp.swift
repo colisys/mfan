@@ -78,6 +78,12 @@ private final class FanModel: ObservableObject {
     @Published private(set) var controlDeadline: TimeInterval?
     @Published private(set) var statusRotationIndex = 0
     @Published private(set) var statusNow = ProcessInfo.processInfo.systemUptime
+    private var currentRefreshInterval: TimeInterval = {
+        let saved = UserDefaults.standard.double(forKey: "refreshInterval")
+        return refreshIntervals.contains(saved) ? saved : defaultRefreshInterval
+    }()
+    private var currentStatusDisplayMode = UserDefaults.standard.string(forKey: "statusDisplayMode") ?? "fan"
+    private var statusTimerInterval: TimeInterval?
 
     private let readQueue = DispatchQueue(label: "MFan.SMC.read", qos: .utility)
     private let commands = CommandRunner()
@@ -118,8 +124,8 @@ private final class FanModel: ObservableObject {
 
         refresh()
         let timer = DispatchSource.makeTimerSource(queue: readQueue)
-        timer.schedule(deadline: .now() + Self.defaultRefreshInterval,
-                       repeating: Self.defaultRefreshInterval, leeway: .milliseconds(250))
+        timer.schedule(deadline: .now() + currentRefreshInterval,
+                       repeating: currentRefreshInterval, leeway: .milliseconds(250))
         timer.setEventHandler { [weak self] in
             Task { @MainActor [weak self] in self?.refresh() }
         }
@@ -127,12 +133,12 @@ private final class FanModel: ObservableObject {
         timer.resume()
 
         let statusTimer = DispatchSource.makeTimerSource(queue: .main)
-        statusTimer.schedule(deadline: .now() + 1, repeating: 1, leeway: .milliseconds(100))
         statusTimer.setEventHandler { [weak self] in
             Task { @MainActor [weak self] in self?.tickStatus() }
         }
         self.statusTimer = statusTimer
         statusTimer.resume()
+        rescheduleStatusTimer()
 
         wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
@@ -160,8 +166,10 @@ private final class FanModel: ObservableObject {
 
     func setRefreshInterval(_ interval: TimeInterval) {
         guard Self.refreshIntervals.contains(interval), let timer else { return }
+        currentRefreshInterval = interval
         timer.schedule(deadline: .now() + interval,
                        repeating: interval, leeway: .milliseconds(250))
+        rescheduleStatusTimer()
         refresh()
     }
 
@@ -361,14 +369,26 @@ private final class FanModel: ObservableObject {
         }
     }
 
+    private func rescheduleStatusTimer() {
+        guard let statusTimer else { return }
+        let countdownIsDisplayed = currentStatusDisplayMode == "countdown" &&
+            (controlDeadline ?? 0) > ProcessInfo.processInfo.systemUptime
+        let interval = countdownIsDisplayed ? 1 : currentRefreshInterval
+        guard statusTimerInterval != interval else { return }
+        statusTimerInterval = interval
+        statusTimer.schedule(deadline: .now() + interval,
+                             repeating: interval,
+                             leeway: .milliseconds(countdownIsDisplayed ? 100 : 250))
+    }
+
     private func tickStatus() {
         statusNow = ProcessInfo.processInfo.systemUptime
-        statusTicks += 1
-        if let deadline = controlDeadline, ProcessInfo.processInfo.systemUptime >= deadline {
+        if let deadline = controlDeadline, statusNow >= deadline {
             controlDeadline = nil
             statusTicks = 0
             statusRotationIndex = 0
-        } else if controlDeadline == nil && statusTicks % 3 == 0 {
+            rescheduleStatusTimer()
+        } else if controlDeadline == nil && currentStatusDisplayMode == "countdown" {
             statusRotationIndex = (statusRotationIndex + 1) % 2
         }
     }
@@ -382,12 +402,16 @@ private final class FanModel: ObservableObject {
         }
         statusTicks = 0
         statusRotationIndex = 0
+        rescheduleStatusTimer()
     }
 
     func setStatusDisplay(_ mode: String) {
-        guard mode == "fan" || mode == "cpu" || mode == "countdown" else { return }
+        guard mode == "fan" || mode == "cpu" || mode == "battery" || mode == "countdown" else { return }
+        currentStatusDisplayMode = mode
         statusDisplayMode = mode
         statusRotationIndex = 0
+        statusTicks = 0
+        rescheduleStatusTimer()
     }
 
     @Published private(set) var statusDisplayMode = "fan"
@@ -471,6 +495,10 @@ private struct MenuBarLabel: View {
         }.first
     }
 
+    private var batteryTemperature: Double? {
+        model.temperatures.first(where: { $0.name == "Battery" })?.celsius
+    }
+
     private var countdown: Int? {
         guard let deadline = model.controlDeadline else { return nil }
         return max(0, Int(ceil(deadline - model.statusNow)))
@@ -483,10 +511,16 @@ private struct MenuBarLabel: View {
 
     var body: some View {
         HStack(spacing: 3) {
-            Image(systemName: showsFan ? "fan.fill" : (showsCountdown ? "timer" : "thermometer.medium"))
+            Image(systemName: statusDisplayMode == "battery" ? "battery.75percent" : (showsFan ? "fan.fill" : (showsCountdown ? "timer" : "thermometer.medium")))
                 .symbolRenderingMode(.hierarchical)
                 .foregroundStyle(showsFan ? iconColor : .primary)
-            if showsCountdown, let countdown {
+            if statusDisplayMode == "battery" {
+                if let batteryTemperature {
+                    Text("\(Int(batteryTemperature))°").font(.caption.monospacedDigit())
+                } else {
+                    Text("--°").font(.caption.monospacedDigit())
+                }
+            } else if showsCountdown, let countdown {
                 Text("\(countdown)s").font(.caption.monospacedDigit())
             } else if showsFan, let fan = model.fans.first {
                 Text("\(Int(fan.currentRPM))").font(.caption.monospacedDigit())
@@ -612,6 +646,7 @@ private struct FanMenuView: View {
                 Picker("状态栏显示", selection: $statusDisplayMode) {
                     Text("风扇转速").tag("fan")
                     Text("CPU 温度").tag("cpu")
+                    Text("电池温度").tag("battery")
                     Text("倒计时").tag("countdown")
                 }
                 .labelsHidden()
