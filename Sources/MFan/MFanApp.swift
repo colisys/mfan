@@ -75,6 +75,9 @@ private final class FanModel: ObservableObject {
     @Published private(set) var commandFailed = false
     @Published private(set) var controlConnectionError: String?
     @Published private var controlMinimums: [Int: Double] = [:]
+    @Published private(set) var controlDeadline: TimeInterval?
+    @Published private(set) var statusRotationIndex = 0
+    @Published private(set) var statusNow = ProcessInfo.processInfo.systemUptime
 
     private let readQueue = DispatchQueue(label: "MFan.SMC.read", qos: .utility)
     private let commands = CommandRunner()
@@ -85,10 +88,12 @@ private final class FanModel: ObservableObject {
     private var timer: DispatchSourceTimer?
     private var startupSettingAttempted = false
     private var heartbeatTimer: DispatchSourceTimer?
+    private var statusTimer: DispatchSourceTimer?
     private var heartbeatActivity: NSObjectProtocol?
     private var heartbeatTask: Task<Void, Never>?
     private var heartbeatPending = false
     private var wakeObserver: NSObjectProtocol?
+    private var statusTicks = 0
 
     static let defaultRefreshInterval: TimeInterval = 5
     static let refreshIntervals: [TimeInterval] = [3, 5, 10, 15, 30]
@@ -121,6 +126,14 @@ private final class FanModel: ObservableObject {
         self.timer = timer
         timer.resume()
 
+        let statusTimer = DispatchSource.makeTimerSource(queue: .main)
+        statusTimer.schedule(deadline: .now() + 1, repeating: 1, leeway: .milliseconds(100))
+        statusTimer.setEventHandler { [weak self] in
+            Task { @MainActor [weak self] in self?.tickStatus() }
+        }
+        self.statusTimer = statusTimer
+        statusTimer.resume()
+
         wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
         ) { [weak self] _ in
@@ -131,6 +144,7 @@ private final class FanModel: ObservableObject {
     deinit {
         timer?.cancel()
         heartbeatTimer?.cancel()
+        statusTimer?.cancel()
         heartbeatTask?.cancel()
         if let heartbeatActivity { ProcessInfo.processInfo.endActivity(heartbeatActivity) }
         if let wakeObserver {
@@ -249,9 +263,8 @@ private final class FanModel: ObservableObject {
             let failure: String?
             do {
                 let response = try await client.send(FanControlRequest(command: "heartbeat"))
-                if let self, self.controlClient === client, !self.busy,
-                   let minima = response.minimumRPMs {
-                    self.controlMinimums = minima
+                if let self, self.controlClient === client, !self.busy {
+                    self.updateControlStatus(response)
                 }
                 failure = response.success ? nil : (response.error ?? "控制服务拒绝心跳")
             } catch {
@@ -336,7 +349,7 @@ private final class FanModel: ObservableObject {
                         "控制请求结果未知，未自动重试：\(error.localizedDescription)"
                     )
                 }
-                if let minima = response.minimumRPMs { self.controlMinimums = minima }
+                self.updateControlStatus(response)
                 self.commandFailed = !response.success
                 self.commandMessage = response.success
                     ? (response.message ?? "操作已完成")
@@ -348,6 +361,37 @@ private final class FanModel: ObservableObject {
         }
     }
 
+    private func tickStatus() {
+        statusNow = ProcessInfo.processInfo.systemUptime
+        statusTicks += 1
+        if let deadline = controlDeadline, ProcessInfo.processInfo.systemUptime >= deadline {
+            controlDeadline = nil
+            statusTicks = 0
+            statusRotationIndex = 0
+        } else if controlDeadline == nil && statusTicks % 3 == 0 {
+            statusRotationIndex = (statusRotationIndex + 1) % 2
+        }
+    }
+
+    private func updateControlStatus(_ response: FanControlResponse) {
+        if let minima = response.minimumRPMs { controlMinimums = minima }
+        if let seconds = response.controlSeconds, seconds > 0 {
+            controlDeadline = ProcessInfo.processInfo.systemUptime + Double(seconds)
+        } else if response.success {
+            controlDeadline = nil
+        }
+        statusTicks = 0
+        statusRotationIndex = 0
+    }
+
+    func setStatusDisplay(_ mode: String) {
+        guard mode == "fan" || mode == "cpu" || mode == "countdown" else { return }
+        statusDisplayMode = mode
+        statusRotationIndex = 0
+    }
+
+    @Published private(set) var statusDisplayMode = "fan"
+
     func quit() {
         Task { @MainActor [weak self] in
             guard let self else { return }
@@ -356,6 +400,8 @@ private final class FanModel: ObservableObject {
             }
             self.heartbeatTimer?.cancel()
             self.heartbeatTimer = nil
+            self.statusTimer?.cancel()
+            self.statusTimer = nil
             if let activity = self.heartbeatActivity {
                 ProcessInfo.processInfo.endActivity(activity)
                 self.heartbeatActivity = nil
@@ -416,17 +462,41 @@ private final class FanModel: ObservableObject {
 
 private struct MenuBarLabel: View {
     @ObservedObject var model: FanModel
+    @AppStorage("statusDisplayMode") private var statusDisplayMode = "fan"
+
+    private var cpuTemperature: Double? {
+        let candidates = ["CPU Die", "CPU Proximity", "CPU Core"]
+        return candidates.lazy.compactMap { name in
+            model.temperatures.first(where: { $0.name == name })?.celsius
+        }.first
+    }
+
+    private var countdown: Int? {
+        guard let deadline = model.controlDeadline else { return nil }
+        return max(0, Int(ceil(deadline - model.statusNow)))
+    }
+
+    private var showsCountdown: Bool { statusDisplayMode == "countdown" && (countdown ?? 0) > 0 }
+    private var showsFan: Bool {
+        statusDisplayMode == "fan" || (statusDisplayMode == "countdown" && !showsCountdown && model.statusRotationIndex == 0)
+    }
 
     var body: some View {
         HStack(spacing: 3) {
-            Image(systemName: "fan.fill")
+            Image(systemName: showsFan ? "fan.fill" : (showsCountdown ? "timer" : "thermometer.medium"))
                 .symbolRenderingMode(.hierarchical)
-                .foregroundStyle(iconColor)
-            if let fan = model.fans.first {
-                Text("\(Int(fan.currentRPM))")
-                    .font(.caption.monospacedDigit())
+                .foregroundStyle(showsFan ? iconColor : .primary)
+            if showsCountdown, let countdown {
+                Text("\(countdown)s").font(.caption.monospacedDigit())
+            } else if showsFan, let fan = model.fans.first {
+                Text("\(Int(fan.currentRPM))").font(.caption.monospacedDigit())
+            } else if let cpuTemperature {
+                Text("\(Int(cpuTemperature))°").font(.caption.monospacedDigit())
+            } else if !showsFan {
+                Text("--°").font(.caption.monospacedDigit())
             }
         }
+        .onChange(of: statusDisplayMode) { mode in model.setStatusDisplay(mode) }
     }
 
     private var iconColor: Color {
@@ -443,6 +513,7 @@ private struct FanMenuView: View {
     @AppStorage("startupFanID") private var startupFanID = 0
     @AppStorage("startupFanRPM") private var startupFanRPM = 0.0
     @AppStorage("refreshInterval") private var refreshInterval = FanModel.defaultRefreshInterval
+    @AppStorage("statusDisplayMode") private var statusDisplayMode = "fan"
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -538,6 +609,17 @@ private struct FanMenuView: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
+                Picker("状态栏显示", selection: $statusDisplayMode) {
+                    Text("风扇转速").tag("fan")
+                    Text("CPU 温度").tag("cpu")
+                    Text("倒计时").tag("countdown")
+                }
+                .labelsHidden()
+                .frame(width: 92)
+                .help("选择菜单栏图标旁的状态")
+                .onChange(of: statusDisplayMode) { mode in
+                    model.setStatusDisplay(mode)
+                }
                 Picker("刷新间隔", selection: $refreshInterval) {
                     ForEach(FanModel.refreshIntervals, id: \.self) { interval in
                         Text("每 \(Int(interval)) 秒").tag(interval)

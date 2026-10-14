@@ -318,8 +318,11 @@ final class PrivilegedFanServer {
             if case .minimum(let original) = restore { return original }
             return nil
         }
+        let now = clock().continuous
+        let seconds = deadlines.values.map { max(0, Int(ceil($0 - now))) }.min()
         let response = FanControlResponse(success: response.success, message: response.message,
-                                          error: response.error, minimumRPMs: minimumRPMs)
+                                          error: response.error, minimumRPMs: minimumRPMs,
+                                          controlSeconds: seconds)
         guard var data = try? JSONEncoder().encode(response) else { return }
         data.append(10)
         // Replies are small, but handle short writes without ever blocking the watchdog.

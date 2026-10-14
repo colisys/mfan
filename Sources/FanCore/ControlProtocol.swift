@@ -20,11 +20,13 @@ public struct FanControlResponse: Codable, Sendable {
     public let error: String?
     /// Original minima saved by the service, before it raised F<n>Mn.
     public let minimumRPMs: [Int: Double]?
+    public let controlSeconds: Int?
 
-    public init(success: Bool, message: String? = nil, error: String? = nil, minimumRPMs: [Int: Double]? = nil) {
+    public init(success: Bool, message: String? = nil, error: String? = nil, minimumRPMs: [Int: Double]? = nil, controlSeconds: Int? = nil) {
         self.success = success
         self.message = message
         self.error = error
         self.minimumRPMs = minimumRPMs
+        self.controlSeconds = controlSeconds
     }
 }
