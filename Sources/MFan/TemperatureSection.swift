@@ -49,7 +49,7 @@ struct TemperatureSection: View {
     private func icon(for name: String) -> String {
         if name.contains("CPU") { return "cpu" }
         if name.contains("GPU") { return "rectangle.3.group" }
-        if name == "Battery" { return "battery.75percent" }
+        if name == "Battery" { return "battery.100" }
         return "thermometer.medium"
     }
 

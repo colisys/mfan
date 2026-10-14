@@ -511,7 +511,7 @@ private struct MenuBarLabel: View {
 
     var body: some View {
         HStack(spacing: 3) {
-            Image(systemName: statusDisplayMode == "battery" ? "battery.75percent" : (showsFan ? "fan.fill" : (showsCountdown ? "timer" : "thermometer.medium")))
+            Image(systemName: statusDisplayMode == "battery" ? "battery.100" : (showsFan ? "fan.fill" : (showsCountdown ? "timer" : "thermometer.medium")))
                 .symbolRenderingMode(.hierarchical)
                 .foregroundStyle(showsFan ? iconColor : .primary)
             if statusDisplayMode == "battery" {
@@ -543,6 +543,7 @@ private struct MenuBarLabel: View {
 
 private struct FanMenuView: View {
     @ObservedObject var model: FanModel
+    @State private var showingMaintenanceGuide = false
     @AppStorage("startupFanEnabled") private var startupFanEnabled = false
     @AppStorage("startupFanID") private var startupFanID = 0
     @AppStorage("startupFanRPM") private var startupFanRPM = 0.0
@@ -555,6 +556,17 @@ private struct FanMenuView: View {
                 Label("MFan", systemImage: "fan.fill")
                     .font(.headline)
                 Spacer()
+                Button {
+                    showingMaintenanceGuide.toggle()
+                } label: {
+                    Image(systemName: "questionmark.circle")
+                        .font(.body)
+                }
+                .buttonStyle(.plain)
+                .help("查看机器保养须知")
+                .popover(isPresented: $showingMaintenanceGuide, arrowEdge: .top) {
+                    MaintenanceGuide()
+                }
                 if model.hasRead && model.readError == nil {
                     Circle().fill(.green).frame(width: 7, height: 7)
                 }
@@ -578,6 +590,7 @@ private struct FanMenuView: View {
                         fan: model.controlSnapshot(fan),
                         busy: model.busy,
                         startupFanID: startupFanID,
+                        startupFanRPM: startupFanRPM,
                         set: { rpm, seconds in
                             model.set(fanID: fan.id, rpm: rpm, seconds: seconds)
                         },
@@ -682,6 +695,7 @@ private struct FanMenuRow: View {
     let fan: FanSnapshot
     let busy: Bool
     let startupFanID: Int
+    let startupFanRPM: Double
     let set: (Int, Int) -> Void
     let setStartup: (Int) -> Void
     @State private var rpm: Double
@@ -693,12 +707,14 @@ private struct FanMenuRow: View {
         fan: FanSnapshot,
         busy: Bool,
         startupFanID: Int,
+        startupFanRPM: Double,
         set: @escaping (Int, Int) -> Void,
         setStartup: @escaping (Int) -> Void
     ) {
         self.fan = fan
         self.busy = busy
         self.startupFanID = startupFanID
+        self.startupFanRPM = startupFanRPM
         self.set = set
         self.setStartup = setStartup
         let initial = fan.targetRPM ?? fan.currentRPM
@@ -746,7 +762,9 @@ private struct FanMenuRow: View {
                     .controlSize(.small)
             }
             if startupFanID == fan.id {
-                Text("已选为启动时设定风扇")
+                Text(startupFanRPM > 0
+                     ? "软件启动后自动设置为\(snappedStartupRPM) rpm"
+                     : "已选为启动时设定风扇")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
@@ -759,6 +777,12 @@ private struct FanMenuRow: View {
     private var snappedRPM: Int {
         guard upper >= lower else { return Int(lower.rounded()) }
         let stepped = lower + ((rpm - lower) / rpmStep).rounded() * rpmStep
+        return Int(min(upper, max(lower, stepped)).rounded())
+    }
+
+    private var snappedStartupRPM: Int {
+        guard lower < upper else { return Int(lower.rounded()) }
+        let stepped = lower + ((startupFanRPM - lower) / rpmStep).rounded() * rpmStep
         return Int(min(upper, max(lower, stepped)).rounded())
     }
 
