@@ -69,11 +69,21 @@ private final class FanModel: ObservableObject {
     @Published private(set) var readError: String?
     @Published private(set) var lastRead: Date?
     @Published private(set) var hasRead = false
-    @Published private(set) var busy = false
+    @Published private(set) var busy = false {
+        didSet { refreshLinkState() }
+    }
     @Published private(set) var operation = ""
     @Published private(set) var commandMessage: String?
     @Published private(set) var commandFailed = false
-    @Published private(set) var controlConnectionError: String?
+    @Published private(set) var controlConnectionError: String? {
+        didSet { refreshLinkState() }
+    }
+    // What the indicator shows: the raw link state held for a minimum time so that
+    // short heartbeats are visible and the light does not flicker.
+    @Published private(set) var linkState: ControlLinkState = .disconnected
+    private var linkFilter = ControlLinkDisplayFilter(minimumHold: FanModel.linkMinimumHold)
+    private var linkHoldTask: Task<Void, Never>?
+    static let linkMinimumHold: TimeInterval = 1.0
     @Published private var controlMinimums: [Int: Double] = [:]
     @Published private(set) var controlDeadline: TimeInterval?
     @Published private(set) var statusRotationIndex = 0
@@ -95,7 +105,9 @@ private final class FanModel: ObservableObject {
     private let readQueue = DispatchQueue(label: "MFan.SMC.read", qos: .utility)
     private let commands = CommandRunner()
     private let reader = FanReader()
-    private var controlClient: PrivilegedControlClient?
+    private var controlClient: PrivilegedControlClient? {
+        didSet { refreshLinkState() }
+    }
     private let serviceID = UUID().uuidString
     private var reading = false
     private var timer: DispatchSourceTimer?
@@ -103,7 +115,9 @@ private final class FanModel: ObservableObject {
     private var heartbeatTimer: DispatchSourceTimer?
     private var statusTimer: DispatchSourceTimer?
     private var heartbeatActivity: NSObjectProtocol?
-    private var heartbeatTask: Task<Void, Never>?
+    private var heartbeatTask: Task<Void, Never>? {
+        didSet { refreshLinkState() }
+    }
     private var heartbeatPending = false
     private var wakeObserver: NSObjectProtocol?
     private var statusTicks = 0
@@ -159,6 +173,7 @@ private final class FanModel: ObservableObject {
         heartbeatTimer?.cancel()
         statusTimer?.cancel()
         heartbeatTask?.cancel()
+        linkHoldTask?.cancel()
         if let heartbeatActivity { ProcessInfo.processInfo.endActivity(heartbeatActivity) }
         if let wakeObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver)
@@ -246,6 +261,26 @@ private final class FanModel: ObservableObject {
         guard rpm > 0 else { return }
         startupSettingAttempted = true
         set(fanID: fan.id, rpm: rpm, seconds: 0)
+    }
+
+    private func refreshLinkState() {
+        let raw = ControlLinkState.resolve(
+            connected: controlClient != nil,
+            hasError: controlConnectionError != nil,
+            busy: busy,
+            heartbeatInFlight: heartbeatTask != nil
+        )
+        linkHoldTask?.cancel()
+        linkHoldTask = nil
+        let delay = linkFilter.update(raw: raw, now: ProcessInfo.processInfo.systemUptime)
+        if linkState != linkFilter.displayed { linkState = linkFilter.displayed }
+        guard let delay else { return }
+        // Re-evaluate with the then-current raw state once the hold has elapsed.
+        linkHoldTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000) + 20_000_000)
+            guard !Task.isCancelled else { return }
+            self?.refreshLinkState()
+        }
     }
 
     private func startHeartbeat(for client: PrivilegedControlClient) async {
@@ -720,9 +755,7 @@ private struct FanMenuView: View {
                 .popover(isPresented: $showingMaintenanceGuide, arrowEdge: .top) {
                     MaintenanceGuide()
                 }
-                if model.hasRead && model.readError == nil {
-                    Circle().fill(.green).frame(width: 7, height: 7)
-                }
+                ControlLinkIndicator(state: model.linkState)
             }
 
             if let error = model.readError {
