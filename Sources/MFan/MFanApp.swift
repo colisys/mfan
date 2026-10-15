@@ -78,6 +78,13 @@ private final class FanModel: ObservableObject {
     @Published private(set) var controlDeadline: TimeInterval?
     @Published private(set) var statusRotationIndex = 0
     @Published private(set) var statusNow = ProcessInfo.processInfo.systemUptime
+    @Published private(set) var processRules: [ProcessRule] = ProcessRuleStore.load()
+    @Published private(set) var ruleMatch: ProcessRuleMatch?
+    // Per-fan RPM the rule engine last sent. Only updated when a request is accepted,
+    // so a failed or cancelled request is not replayed on every refresh.
+    private var ruleApplied: [Int: Int] = [:]
+    // Fans a rule may still be holding; manual actions on a fan take it away.
+    private var ruleOwned: Set<Int> = []
     private var currentRefreshInterval: TimeInterval = {
         let saved = UserDefaults.standard.double(forKey: "refreshInterval")
         return refreshIntervals.contains(saved) ? saved : defaultRefreshInterval
@@ -177,8 +184,10 @@ private final class FanModel: ObservableObject {
         guard Self.supportsArchitecture, !Self.isTranslated, !reading else { return }
         reading = true
         let reader = self.reader
+        let scanProcesses = processRules.contains { $0.enabled }
         readQueue.async { [weak self] in
             let result = Result { try reader.read() }
+            let running: Set<String>? = scanProcesses ? ProcessScanner.runningNames() : nil
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.reading = false
@@ -192,6 +201,7 @@ private final class FanModel: ObservableObject {
                     if self.readError != nil { self.readError = nil }
 
                     self.applyStartupSettingIfNeeded()
+                    self.evaluateProcessRules(running: running)
                 case .failure(let error):
                     if !self.fans.isEmpty { self.fans = [] }
                     let message = "读取 SMC 失败：\(error.localizedDescription)"
@@ -214,6 +224,7 @@ private final class FanModel: ObservableObject {
         guard !busy, readError == nil,
               let snapshot = fans.first(where: { $0.id == fanID }),
               seconds == 0 || (30...600).contains(seconds) else { return }
+        ruleOwned.remove(fanID)
         let fan = controlSnapshot(snapshot)
         let rpm = Int(min(floor(fan.maximumRPM), max(ceil(fan.minimumRPM), Double(rpm))))
 
@@ -294,25 +305,34 @@ private final class FanModel: ObservableObject {
 
     func restoreAutomatic() {
         guard !busy, Self.supportsArchitecture, !Self.isTranslated else { return }
+        ruleOwned.removeAll()
         execute(
             request: FanControlRequest(command: "auto"),
             description: "正在恢复所有风扇的自动控制…"
         )
     }
 
-    private func execute(request: FanControlRequest, description: String) {
-        guard !busy else { return }
+    @discardableResult
+    private func execute(request: FanControlRequest, description: String) -> Bool {
+        execute(requests: [request], description: description)
+    }
+
+    /// Sends the requests in order over one control session. Returns whether the
+    /// work was accepted (the control service may still reject individual requests).
+    @discardableResult
+    private func execute(requests: [FanControlRequest], description: String) -> Bool {
+        guard !busy, !requests.isEmpty else { return false }
         guard let directory = Bundle.main.executableURL?.deletingLastPathComponent() else {
             commandFailed = true
             commandMessage = FanError.missingCLI.localizedDescription
-            return
+            return false
         }
 
         let cli = directory.appendingPathComponent("fanctl")
         guard FileManager.default.isExecutableFile(atPath: cli.path) else {
             commandFailed = true
             commandMessage = FanError.missingCLI.localizedDescription
-            return
+            return false
         }
 
         busy = true
@@ -348,25 +368,151 @@ private final class FanModel: ObservableObject {
                     client = try await self.waitForControlClient()
                 }
 
-                let response: FanControlResponse
-                do {
-                    response = try await client.send(request)
-                } catch {
-                    // A missing response does not mean the write was not applied. Never replay it.
-                    throw FanError.controlRequestFailed(
-                        "控制请求结果未知，未自动重试：\(error.localizedDescription)"
-                    )
+                var messages: [String] = []
+                var failures: [String] = []
+                for request in requests {
+                    let response: FanControlResponse
+                    do {
+                        response = try await client.send(request)
+                    } catch {
+                        // A missing response does not mean the write was not applied. Never replay it.
+                        throw FanError.controlRequestFailed(
+                            "控制请求结果未知，未自动重试：\(error.localizedDescription)"
+                        )
+                    }
+                    self.updateControlStatus(response)
+                    if response.success {
+                        messages.append(response.message ?? "操作已完成")
+                    } else {
+                        failures.append(response.error ?? "控制服务拒绝请求")
+                    }
                 }
-                self.updateControlStatus(response)
-                self.commandFailed = !response.success
-                self.commandMessage = response.success
-                    ? (response.message ?? "操作已完成")
-                    : (response.error ?? "控制服务拒绝请求")
+                self.commandFailed = !failures.isEmpty
+                self.commandMessage = (failures.isEmpty ? messages : failures).joined(separator: "\n")
             } catch {
                 self.commandFailed = true
                 self.commandMessage = self.serviceErrorMessage(error)
             }
         }
+        return true
+    }
+
+    // MARK: Process rules
+
+    /// `fanID` nil applies the rule to every fan. The same process may have one
+    /// rule per target (all fans, or each individual fan).
+    func addProcessRule(name: String, rpm: Int, fanID: Int?) {
+        let key = ProcessRuleResolver.normalized(name)
+        guard !key.isEmpty, rpm > 0, (fanID ?? 0) >= 0 else { return }
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let index = processRules.firstIndex(where: {
+            ProcessRuleResolver.normalized($0.name) == key && $0.fanID == fanID
+        }) {
+            processRules[index].rpm = rpm
+            processRules[index].enabled = true
+        } else {
+            processRules.append(ProcessRule(name: trimmed, rpm: rpm, fanID: fanID))
+        }
+        commitProcessRules()
+    }
+
+    func removeProcessRule(id: UUID) {
+        processRules.removeAll { $0.id == id }
+        commitProcessRules()
+    }
+
+    func setProcessRule(id: UUID, enabled: Bool) {
+        guard let index = processRules.firstIndex(where: { $0.id == id }) else { return }
+        processRules[index].enabled = enabled
+        commitProcessRules()
+    }
+
+    func setProcessRule(id: UUID, rpm: Int) {
+        guard rpm > 0, let index = processRules.firstIndex(where: { $0.id == id }) else { return }
+        processRules[index].rpm = rpm
+        commitProcessRules()
+    }
+
+    private func commitProcessRules() {
+        ProcessRuleStore.save(processRules)
+        if !processRules.contains(where: { $0.enabled }) { ruleMatch = nil }
+        refresh()
+    }
+
+    /// Edge-triggered per fan: a fan is touched only when its resolved target
+    /// changes, so a manual override stays until a rule for that fan changes.
+    private func evaluateProcessRules(running: Set<String>?) {
+        let hasEnabledRules = processRules.contains { $0.enabled }
+        // The scan result predates a rule being enabled; wait for the next read.
+        if running == nil && hasEnabledRules { return }
+        let match = ProcessRuleResolver.resolve(
+            rules: processRules, running: running ?? [], fanIDs: fans.map(\.id)
+        )
+        if ruleMatch != match { ruleMatch = match }
+        let desired = match?.targets ?? [:]
+
+        // A fan neither wanted nor held by a rule has nothing to remember.
+        for fan in Array(ruleApplied.keys) where desired[fan] == nil && !ruleOwned.contains(fan) {
+            ruleApplied.removeValue(forKey: fan)
+        }
+        guard !busy, readError == nil else { return }
+
+        let plan = ProcessRulePlan.make(
+            desired: desired, applied: ruleApplied, owned: ruleOwned, knownFans: Set(fans.map(\.id)),
+            startup: startupSetting
+        )
+        guard !plan.isEmpty else { return }
+        if !plan.releases.isEmpty, !(Self.supportsArchitecture && !Self.isTranslated) { return }
+
+        func clamped(_ fanID: Int, _ target: Int) -> Double? {
+            guard let snapshot = fans.first(where: { $0.id == fanID }) else { return nil }
+            let fan = controlSnapshot(snapshot)
+            return min(floor(fan.maximumRPM), max(ceil(fan.minimumRPM), Double(target)))
+        }
+
+        var requests: [FanControlRequest] = []
+        for fanID in plan.sets.keys.sorted() {
+            guard let target = plan.sets[fanID], let rpm = clamped(fanID, target) else { continue }
+            requests.append(FanControlRequest(command: "set", fan: fanID, rpm: rpm, seconds: 0))
+        }
+        // A finished rule returns to the startup setting when one exists; otherwise automatic.
+        for fanID in plan.restores.keys.sorted() {
+            guard let target = plan.restores[fanID], let rpm = clamped(fanID, target) else { continue }
+            requests.append(FanControlRequest(command: "set", fan: fanID, rpm: rpm, seconds: 0))
+        }
+        for fanID in plan.releases.sorted() {
+            requests.append(FanControlRequest(command: "auto", fan: fanID))
+        }
+
+        var parts: [String] = []
+        for fanID in plan.sets.keys.sorted() { parts.append("#\(fanID) → \(plan.sets[fanID] ?? 0)") }
+        for fanID in plan.restores.keys.sorted() { parts.append("#\(fanID) 回到启动设定 \(plan.restores[fanID] ?? 0)") }
+        for fanID in plan.releases.sorted() { parts.append("#\(fanID) 恢复自动") }
+        if execute(requests: requests, description: "进程规则 · " + parts.joined(separator: "，")) {
+            // A write may land even if its reply is lost, so own those fans from here on.
+            for (fanID, rpm) in plan.sets {
+                ruleApplied[fanID] = rpm
+                ruleOwned.insert(fanID)
+            }
+            // Restored to the startup setting, which is not a rule hold.
+            for fanID in plan.restores.keys {
+                ruleApplied.removeValue(forKey: fanID)
+                ruleOwned.remove(fanID)
+            }
+            for fanID in plan.releases {
+                ruleApplied.removeValue(forKey: fanID)
+                ruleOwned.remove(fanID)
+            }
+        }
+    }
+
+    /// The saved startup setting, if enabled and usable.
+    private var startupSetting: (fan: Int, rpm: Int)? {
+        let defaults = UserDefaults.standard
+        guard defaults.bool(forKey: "startupFanEnabled") else { return nil }
+        let rpm = defaults.double(forKey: "startupFanRPM")
+        guard rpm.isFinite, rpm > 0 else { return nil }
+        return (defaults.integer(forKey: "startupFanID"), Int(rpm))
     }
 
     private func rescheduleStatusTimer() {
@@ -550,6 +696,13 @@ private struct FanMenuView: View {
     @AppStorage("refreshInterval") private var refreshInterval = FanModel.defaultRefreshInterval
     @AppStorage("statusDisplayMode") private var statusDisplayMode = "fan"
 
+    // Each fan's reachable span, so a per-fan rule slider uses that fan's own limits.
+    private var ruleFanRanges: [RuleFanRange] {
+        model.fans.map(model.controlSnapshot).map {
+            RuleFanRange(id: $0.id, lower: Int(ceil($0.minimumRPM)), upper: Int(floor($0.maximumRPM)))
+        }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
@@ -589,7 +742,7 @@ private struct FanMenuView: View {
                     FanMenuRow(
                         fan: model.controlSnapshot(fan),
                         busy: model.busy,
-                        startupFanID: startupFanID,
+                        startupEnabled: startupFanEnabled && startupFanID == fan.id,
                         startupFanRPM: startupFanRPM,
                         set: { rpm, seconds in
                             model.set(fanID: fan.id, rpm: rpm, seconds: seconds)
@@ -598,9 +751,21 @@ private struct FanMenuView: View {
                             startupFanEnabled = true
                             startupFanID = fan.id
                             startupFanRPM = Double(rpm)
-                        }
+                        },
+                        cancelStartup: { startupFanEnabled = false }
                     )
                 }
+
+                ProcessRulesSection(
+                    rules: model.processRules,
+                    match: model.ruleMatch,
+                    fans: ruleFanRanges,
+                    busy: model.busy,
+                    add: { model.addProcessRule(name: $0, rpm: $1, fanID: $2) },
+                    remove: { model.removeProcessRule(id: $0) },
+                    setEnabled: { model.setProcessRule(id: $0, enabled: $1) },
+                    setRPM: { model.setProcessRule(id: $0, rpm: $1) }
+                )
             }
 
             if !model.temperatures.isEmpty {
@@ -634,6 +799,7 @@ private struct FanMenuView: View {
                 Button("恢复自动") {
                     model.restoreAutomatic()
                 }
+                .controlSize(.small)
                 .disabled(model.busy || !FanModel.supportsArchitecture)
                 Spacer()
                 if let date = model.lastRead {
@@ -644,18 +810,6 @@ private struct FanMenuView: View {
             }
 
             HStack {
-                if startupFanEnabled {
-                    Button("取消启动设定") {
-                        startupFanEnabled = false
-                    }
-                    .buttonStyle(.borderless)
-                    .font(.caption2)
-                } else {
-                    Text("启动设定未启用")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
                 Picker("状态栏显示", selection: $statusDisplayMode) {
                     Text("风扇转速").tag("fan")
                     Text("CPU 温度").tag("cpu")
@@ -679,10 +833,11 @@ private struct FanMenuView: View {
                 .onChange(of: refreshInterval) { interval in
                     model.setRefreshInterval(interval)
                 }
+                Spacer()
                 Button("退出") {
                     model.quit()
                 }
-                .buttonStyle(.borderless)
+                .controlSize(.small)
             }
         }
         .padding(12)
@@ -694,10 +849,11 @@ private struct FanMenuView: View {
 private struct FanMenuRow: View {
     let fan: FanSnapshot
     let busy: Bool
-    let startupFanID: Int
+    let startupEnabled: Bool
     let startupFanRPM: Double
     let set: (Int, Int) -> Void
     let setStartup: (Int) -> Void
+    let cancelStartup: () -> Void
     @State private var rpm: Double
     @State private var seconds = 60
 
@@ -706,17 +862,19 @@ private struct FanMenuRow: View {
     init(
         fan: FanSnapshot,
         busy: Bool,
-        startupFanID: Int,
+        startupEnabled: Bool,
         startupFanRPM: Double,
         set: @escaping (Int, Int) -> Void,
-        setStartup: @escaping (Int) -> Void
+        setStartup: @escaping (Int) -> Void,
+        cancelStartup: @escaping () -> Void
     ) {
         self.fan = fan
         self.busy = busy
-        self.startupFanID = startupFanID
+        self.startupEnabled = startupEnabled
         self.startupFanRPM = startupFanRPM
         self.set = set
         self.setStartup = setStartup
+        self.cancelStartup = cancelStartup
         let initial = fan.targetRPM ?? fan.currentRPM
         _rpm = State(initialValue: min(floor(fan.maximumRPM), max(ceil(fan.minimumRPM), initial)))
     }
@@ -755,18 +913,25 @@ private struct FanMenuRow: View {
 
                 Spacer()
 
-                Button("启动设定") { setStartup(snappedRPM) }
-                    .controlSize(.small)
-                    .disabled(busy)
                 Button("设定") { set(snappedRPM, seconds) }
                     .controlSize(.small)
             }
-            if startupFanID == fan.id {
-                Text(startupFanRPM > 0
-                     ? "软件启动后自动设置为\(snappedStartupRPM) rpm"
-                     : "已选为启动时设定风扇")
+
+            // Both startup buttons share one style and sit on one line.
+            HStack(spacing: 6) {
+                Text(startupEnabled && startupFanRPM > 0
+                     ? "启动时设为 \(snappedStartupRPM) RPM"
+                     : "未启用启动设定")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Spacer()
+                Button("启动设定") { setStartup(snappedRPM) }
+                    .controlSize(.small)
+                if startupEnabled {
+                    Button("取消启动设定") { cancelStartup() }
+                        .controlSize(.small)
+                }
             }
         }
         .disabled(busy)
