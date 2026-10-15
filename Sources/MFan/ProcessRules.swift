@@ -103,6 +103,7 @@ struct ProcessRulePlan: Equatable {
     ///   goes back to this RPM; every other fan goes back to automatic.
     static func make(
         desired: [Int: Int], applied: [Int: Int], owned: Set<Int>, knownFans: Set<Int>,
+        startupSettings: [Int: Int] = [:],
         startup: (fan: Int, rpm: Int)? = nil
     ) -> ProcessRulePlan {
         var plan = ProcessRulePlan()
@@ -110,7 +111,10 @@ struct ProcessRulePlan: Equatable {
             plan.sets[fan] = rpm
         }
         for fan in owned where desired[fan] == nil && knownFans.contains(fan) {
-            if let startup, startup.fan == fan, startup.rpm > 0 {
+            if let rpm = startupSettings[fan], rpm > 0 {
+                plan.restores[fan] = rpm
+            } else if let startup, startup.fan == fan, startup.rpm > 0 {
+                // Compatibility for existing callers and older persisted tests.
                 plan.restores[fan] = startup.rpm
             } else {
                 plan.releases.insert(fan)
