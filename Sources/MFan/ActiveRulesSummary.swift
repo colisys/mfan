@@ -9,12 +9,20 @@ struct ActiveRulesSummary: View {
     let cpuTemperature: Double?
     let open: () -> Void
 
-    private var effectiveRules: [(name: String, isGlobal: Bool)] {
+    private var effectiveRules: [(name: String, detail: String, on: Bool)] {
         guard let match else { return [] }
         let all = match.winners.map { ($0, $0 == "全局温控") }
         let nonGlobal = all.filter { !$0.1 }
-        // Show only rules when they override the global curve.
-        return nonGlobal.isEmpty ? all : nonGlobal
+        
+        if !nonGlobal.isEmpty {
+            // Rules override global: show only rules
+            return nonGlobal.map { ($0.0, "生效中", true) }
+        } else if !all.isEmpty {
+            // Only global is winning: show it with status
+            return [("全局温控", globalDetail, thermal.enabled)]
+        } else {
+            return []
+        }
     }
 
     private var waitingCount: Int { match?.armedIDs.count ?? 0 }
@@ -43,13 +51,12 @@ struct ActiveRulesSummary: View {
                         .lineLimit(1)
                 }
             }
-            line(title: "全局温控", detail: globalDetail, on: thermal.enabled)
             if effectiveRules.isEmpty {
                 line(title: "规则", detail: waitingCount > 0 ? "\(waitingCount) 条等待触发"
                      : (rules.isEmpty ? "未设置" : "无生效"), on: false)
             } else {
                 ForEach(effectiveRules, id: \.name) { item in
-                    line(title: item.name, detail: "生效中", on: true)
+                    line(title: item.name, detail: item.detail, on: item.on)
                 }
             }
             Button(action: open) {
