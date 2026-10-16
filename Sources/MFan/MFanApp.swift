@@ -37,7 +37,7 @@ private enum FanError: LocalizedError {
 }
 
 // Only the serial read queue accesses this client's SMC state.
-private final class FanReader {
+private final class FanReader: @unchecked Sendable {
     private var client: SMCClient?
 
     func read() throws -> ([FanSnapshot], [TemperatureSnapshot]) {
@@ -812,6 +812,7 @@ private struct MenuBarLabel: View {
 private struct FanMenuView: View {
     @ObservedObject var model: FanModel
     @State private var showingMaintenanceGuide = false
+    @State private var touchBarFanID = 0
     @AppStorage("refreshInterval") private var refreshInterval = FanModel.defaultRefreshInterval
     @AppStorage("statusDisplayMode") private var statusDisplayMode = "fan"
 
@@ -976,7 +977,141 @@ private struct FanMenuView: View {
         .padding(12)
         .frame(width: 330)
         .onAppear { model.refresh() }
+        .background(TouchBarInstaller(model: model).frame(width: 0, height: 0))
     }
+}
+
+/// Installs a native NSTouchBar on the transient MenuBarExtra panel. SwiftUI's
+/// `.touchBar` modifier does not reach this panel's AppKit window.
+private struct TouchBarInstaller: NSViewRepresentable {
+    let model: FanModel
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        context.coordinator.start(model: model)
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        context.coordinator.model = model
+        context.coordinator.refresh()
+    }
+
+    func makeCoordinator() -> TouchBarCoordinator { TouchBarCoordinator() }
+}
+
+@MainActor
+private final class TouchBarCoordinator: NSObject, NSTouchBarDelegate {
+    weak var model: FanModel?
+    private var observer: NSObjectProtocol?
+    private weak var installedWindow: NSWindow?
+    private var selectedFanID = 0
+    private var segmented = NSSegmentedControl()
+    private var slider = NSSlider()
+    private var valueLabel = NSTextField(labelWithString: "")
+    private var restoreButton = NSButton(title: "恢复自动", target: nil, action: nil)
+
+    func start(model: FanModel) {
+        self.model = model
+        observer = NotificationCenter.default.addObserver(
+            forName: NSWindow.didBecomeKeyNotification, object: nil, queue: .main
+        ) { [weak self] notification in
+            guard let window = notification.object as? NSWindow else { return }
+            Task { @MainActor [weak self] in
+                self?.install(on: window)
+            }
+        }
+    }
+
+    deinit {
+        if let observer { NotificationCenter.default.removeObserver(observer) }
+    }
+
+    func refresh() {
+        guard let model else { return }
+        let ids = model.fans.map(\.id)
+        if !ids.contains(selectedFanID), let first = ids.first { selectedFanID = first }
+        segmented.segmentCount = ids.count
+        for (index, id) in ids.enumerated() {
+            segmented.setLabel("风扇 \(id)", forSegment: index)
+        }
+        guard let fan = model.fans.first(where: { $0.id == selectedFanID }) else {
+            slider.isEnabled = false
+            restoreButton.isEnabled = false
+            valueLabel.stringValue = "无风扇数据"
+            return
+        }
+        let snapshot = model.controlSnapshot(fan)
+        let lower = ceil(snapshot.minimumRPM)
+        let upper = floor(snapshot.maximumRPM)
+        slider.minValue = lower
+        slider.maxValue = max(lower, upper)
+        slider.doubleValue = min(slider.maxValue, max(lower, snapshot.targetRPM ?? snapshot.currentRPM))
+        slider.isEnabled = !model.busy && upper > lower
+        restoreButton.isEnabled = !model.busy
+        valueLabel.stringValue = "\(Int(slider.doubleValue.rounded())) RPM"
+    }
+
+    private func install(on window: NSWindow) {
+        guard window.isVisible else { return }
+        installedWindow = window
+        window.touchBar = makeTouchBar()
+        refresh()
+    }
+
+    private func makeTouchBar() -> NSTouchBar {
+        segmented = NSSegmentedControl(labels: [], trackingMode: .selectOne, target: self, action: #selector(selectFan(_:)))
+        segmented.segmentStyle = .texturedRounded
+        slider = NSSlider(target: self, action: #selector(commitSpeed(_:)))
+        slider.isContinuous = false
+        valueLabel = NSTextField(labelWithString: "")
+        valueLabel.alignment = .right
+        valueLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .regular)
+        restoreButton = NSButton(title: "恢复自动", target: self, action: #selector(restoreAutomatic(_:)))
+        let bar = NSTouchBar()
+        bar.delegate = self
+        bar.defaultItemIdentifiers = [.fanSelector, .fanSlider, .fanValue, .fanRestore]
+        return bar
+    }
+
+    func touchBar(_ touchBar: NSTouchBar, makeItemForIdentifier identifier: NSTouchBarItem.Identifier) -> NSTouchBarItem? {
+        let item = NSCustomTouchBarItem(identifier: identifier)
+        switch identifier {
+        case .fanSelector:
+            item.view = segmented
+        case .fanSlider:
+            item.view = slider
+        case .fanValue:
+            item.view = valueLabel
+        case .fanRestore:
+            item.view = restoreButton
+        default:
+            return nil
+        }
+        return item
+    }
+
+    @objc private func selectFan(_ sender: NSSegmentedControl) {
+        guard sender.selectedSegment >= 0 else { return }
+        selectedFanID = model?.fans[sender.selectedSegment].id ?? selectedFanID
+        refresh()
+    }
+
+    @objc private func commitSpeed(_ sender: NSSlider) {
+        guard let model, let fan = model.fans.first(where: { $0.id == selectedFanID }), !model.busy else { return }
+        model.set(fanID: fan.id, rpm: Int(sender.doubleValue.rounded()), seconds: 0)
+    }
+
+    @objc private func restoreAutomatic(_ sender: NSButton) {
+        model?.restoreAutomatic(fanID: selectedFanID)
+    }
+}
+
+private extension NSTouchBarItem.Identifier {
+    static let fanSelector = NSTouchBarItem.Identifier("local.mfan.fan-selector")
+    static let fanSlider = NSTouchBarItem.Identifier("local.mfan.fan-slider")
+    static let fanValue = NSTouchBarItem.Identifier("local.mfan.fan-value")
+    static let fanRestore = NSTouchBarItem.Identifier("local.mfan.fan-restore")
 }
 
 private struct FanMenuRow: View {
