@@ -922,7 +922,12 @@ private struct FanMenuView: View {
                 Button("全部恢复自动") {
                     model.restoreAllAutomatic()
                 }
-                .controlSize(.small)
+                .buttonStyle(.plain)
+                .font(.caption2)
+                .foregroundStyle(.primary)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 2)
+                .background(.quaternary, in: RoundedRectangle(cornerRadius: 4))
                 .disabled(model.busy || !FanModel.supportsArchitecture)
                 Spacer()
                 if let date = model.lastRead {
@@ -960,7 +965,12 @@ private struct FanMenuView: View {
                 Button("退出") {
                     model.quit()
                 }
-                .controlSize(.small)
+                .buttonStyle(.plain)
+                .font(.caption2)
+                .foregroundStyle(.primary)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 2)
+                .background(.quaternary, in: RoundedRectangle(cornerRadius: 4))
             }
         }
         .padding(12)
@@ -1053,9 +1063,19 @@ private struct FanMenuRow: View {
                 Spacer()
 
                 Button("设定") { set(snappedRPM, seconds) }
-                    .controlSize(.small)
+                    .buttonStyle(.plain)
+                    .font(.caption2)
+                    .foregroundStyle(.primary)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 2)
+                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 4))
                 Button("恢复自动") { restoreAutomatic() }
-                    .controlSize(.small)
+                    .buttonStyle(.plain)
+                    .font(.caption2)
+                    .foregroundStyle(.primary)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 2)
+                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 4))
             }
 
             // Both startup buttons share one style and sit on one line.
@@ -1068,10 +1088,20 @@ private struct FanMenuRow: View {
                     .lineLimit(1)
                 Spacer()
                 Button("启动设定") { setStartup(snappedRPM) }
-                    .controlSize(.small)
+                    .buttonStyle(.plain)
+                    .font(.caption2)
+                    .foregroundStyle(.primary)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 2)
+                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 4))
                 if startupEnabled {
                     Button("取消启动设定") { cancelStartup() }
-                        .controlSize(.small)
+                        .buttonStyle(.plain)
+                        .font(.caption2)
+                        .foregroundStyle(.primary)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(.quaternary, in: RoundedRectangle(cornerRadius: 4))
                 }
             }
         }

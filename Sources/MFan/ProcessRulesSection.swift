@@ -249,13 +249,15 @@ struct ProcessRulesSection: View {
                 Spacer()
                 Button(action: commitNew) {
                     Text("添加规则")
-                        .font(.caption)
-                        .foregroundStyle(.primary)
+                        .font(.caption2.weight(.medium))
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
+                .buttonStyle(.plain)
+                .foregroundStyle(.primary)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 2)
+                .background(.quaternary, in: RoundedRectangle(cornerRadius: 4))
                 .fixedSize()
-                .disabled(!canAdd)
+                .opacity(canAdd ? 1 : 0.55)
             }
         }
     }
@@ -363,8 +365,11 @@ private struct ProcessRuleRow: View {
         } else {
             Button("添加温度条件") { setTriggerTemp(snappedTempDraft) }
                 .buttonStyle(.plain)
+                .foregroundStyle(.primary)
                 .font(.caption2)
-                .foregroundStyle(.secondary)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 2)
+                .background(.quaternary, in: RoundedRectangle(cornerRadius: 4))
                 .disabled(!rule.enabled)
         }
     }
