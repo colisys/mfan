@@ -13,6 +13,13 @@ struct MFanApp: App {
             MenuBarLabel(model: model)
         }
         .menuBarExtraStyle(.window)
+
+        Window("MFan 控制中心", id: "control") {
+            ControlCenterView(model: model)
+                .background(TouchBarInstaller(model: model))
+        }
+        .windowStyle(.hiddenTitleBar)
+        .defaultSize(width: 1040, height: 680)
     }
 }
 
@@ -69,7 +76,7 @@ private final class FanReader: @unchecked Sendable {
 }
 
 @MainActor
-private final class FanModel: ObservableObject {
+final class FanModel: ObservableObject {
     @Published private(set) var fans: [FanSnapshot] = []
     @Published private(set) var temperatures: [TemperatureSnapshot] = []
     @Published private(set) var readError: String?
@@ -96,6 +103,24 @@ private final class FanModel: ObservableObject {
     @Published private(set) var statusNow = ProcessInfo.processInfo.systemUptime
     @Published private(set) var processRules: [ProcessRule] = ProcessRuleStore.load()
     @Published private(set) var ruleMatch: ProcessRuleMatch?
+    @Published private(set) var thermalConfiguration = ThermalStore.load()
+    /// Page the control center shows; the menu bar panel sets it before opening the window.
+    @Published var controlPage: ControlPage = .overview
+    /// Fan the Touch Bar is controlling; kept here so rebuilding the bar does not reset it.
+    var touchBarFanID = 0
+    private var thermalOverrides: Set<Int> = []
+
+    func saveThermalConfiguration(_ configuration: ThermalConfiguration) {
+        guard ThermalStore.save(configuration) else { return }
+        thermalConfiguration = configuration
+        resumeThermalControl()
+    }
+
+    func resumeThermalControl() {
+        thermalOverrides.removeAll()
+        ruleApplied.removeAll()
+        refresh()
+    }
     // Fans last set without a time limit by this app. The service reports only the
     // shortest deadline across fans, so "unlimited" is tracked per fan here.
     @Published private(set) var unlimitedFans: Set<Int> = []
@@ -104,8 +129,6 @@ private final class FanModel: ObservableObject {
     private var ruleApplied: [Int: Int] = [:]
     // Fans a rule may still be holding; manual actions on a fan take it away.
     private var ruleOwned: Set<Int> = []
-    // Fans whose rule fired on the last evaluation; drives temperature hysteresis.
-    private var ruleTriggered: Set<Int> = []
     private var currentRefreshInterval: TimeInterval = {
         let saved = UserDefaults.standard.double(forKey: "refreshInterval")
         return refreshIntervals.contains(saved) ? saved : defaultRefreshInterval
@@ -232,6 +255,7 @@ private final class FanModel: ObservableObject {
                     if !self.fans.isEmpty { self.fans = [] }
                     let message = "读取 SMC 失败：\(error.localizedDescription)"
                     if self.readError != message { self.readError = message }
+                    self.releaseThermalOnReadFailure()
                 }
             }
         }
@@ -250,6 +274,7 @@ private final class FanModel: ObservableObject {
         guard !busy, readError == nil,
               let snapshot = fans.first(where: { $0.id == fanID }),
               seconds == 0 || (30...600).contains(seconds) else { return }
+        thermalOverrides.insert(fanID)
         ruleOwned.remove(fanID)
         let fan = controlSnapshot(snapshot)
         let rpm = Int(min(floor(fan.maximumRPM), max(ceil(fan.minimumRPM), Double(rpm))))
@@ -272,6 +297,7 @@ private final class FanModel: ObservableObject {
             guard rpm > 0 else { continue }
             startupSettingAttempted.insert(fan.id)
             set(fanID: fan.id, rpm: rpm, seconds: 0)
+            thermalOverrides.remove(fan.id)
         }
     }
 
@@ -379,6 +405,7 @@ private final class FanModel: ObservableObject {
 
     func restoreAutomatic(fanID: Int) {
         guard !busy, Self.supportsArchitecture, !Self.isTranslated else { return }
+        thermalOverrides.insert(fanID)
         ruleOwned.remove(fanID)
         execute(
             request: FanControlRequest(command: "auto", fan: fanID),
@@ -388,6 +415,7 @@ private final class FanModel: ObservableObject {
 
     func restoreAllAutomatic() {
         guard !busy, Self.supportsArchitecture, !Self.isTranslated else { return }
+        thermalOverrides.formUnion(fans.map(\.id))
         ruleOwned.removeAll()
         execute(
             request: FanControlRequest(command: "auto"),
@@ -481,14 +509,23 @@ private final class FanModel: ObservableObject {
         return true
     }
 
+    private func releaseThermalOnReadFailure() {
+        guard !busy, !ruleOwned.isEmpty else { return }
+        let requests = ruleOwned.sorted().map { FanControlRequest(command: "auto", fan: $0) }
+        if execute(requests: requests, description: "温度读取失败，恢复系统自动控制…") {
+            ruleOwned.removeAll()
+            ruleApplied.removeAll()
+        }
+    }
+
     // MARK: Process rules
 
     /// `fanID` nil applies the rule to every fan. An empty `name` makes a
     /// temperature-only rule, which then requires `triggerTemp`. The same process may
     /// have one rule per target (all fans, or each individual fan).
-    func addProcessRule(name: String, rpm: Int, fanID: Int?, triggerTemp: Int?) {
+    func addProcessRule(name: String, percent: Int, fanID: Int?, triggerTemp: Int?) {
         let key = ProcessRuleResolver.normalized(name)
-        guard rpm > 0, (fanID ?? 0) >= 0,
+        guard (1...100).contains(percent), (fanID ?? 0) >= 0,
               triggerTemp.map({ RuleTemperature.range.contains($0) }) ?? true,
               !key.isEmpty || triggerTemp != nil else { return }
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -497,11 +534,13 @@ private final class FanModel: ObservableObject {
             ProcessRuleResolver.normalized($0.name) == key && $0.fanID == fanID
                 && (!key.isEmpty || $0.triggerTemp == triggerTemp)
         }) {
-            processRules[index].rpm = rpm
+            processRules[index].rpm = 0
+            processRules[index].percent = percent
             processRules[index].triggerTemp = triggerTemp
             processRules[index].enabled = true
         } else {
-            processRules.append(ProcessRule(name: trimmed, rpm: rpm, fanID: fanID, triggerTemp: triggerTemp))
+            processRules.append(ProcessRule(name: trimmed, rpm: 0, fanID: fanID,
+                                            triggerTemp: triggerTemp, percent: percent))
         }
         commitProcessRules()
     }
@@ -529,9 +568,12 @@ private final class FanModel: ObservableObject {
         commitProcessRules()
     }
 
-    func setProcessRule(id: UUID, rpm: Int) {
-        guard rpm > 0, let index = processRules.firstIndex(where: { $0.id == id }) else { return }
-        processRules[index].rpm = rpm
+    /// Setting a percentage also converts a legacy absolute-RPM rule.
+    func setProcessRule(id: UUID, percent: Int) {
+        guard (1...100).contains(percent),
+              let index = processRules.firstIndex(where: { $0.id == id }) else { return }
+        processRules[index].rpm = 0
+        processRules[index].percent = percent
         commitProcessRules()
     }
 
@@ -547,13 +589,18 @@ private final class FanModel: ObservableObject {
         let needsProcessScan = processRules.contains { $0.enabled && !$0.isTemperatureOnly }
         // The scan result predates a process rule being enabled; wait for the next read.
         if running == nil && needsProcessScan { return }
-        let match = ProcessRuleResolver.resolve(
-            rules: processRules, running: running ?? [], fanIDs: fans.map(\.id),
-            temperature: TemperatureSource.cpuCelsius(temperatures), wasTriggered: ruleTriggered
+        let match = ThermalResolver.resolve(
+            configuration: thermalConfiguration, rules: processRules, running: running ?? [],
+            fans: fans.map(controlSnapshot).map {
+                RuleFanRange(id: $0.id, lower: Int(ceil($0.minimumRPM)), upper: Int(floor($0.maximumRPM)))
+            }, temperature: TemperatureSource.cpuCelsius(temperatures)
         )
         if ruleMatch != match { ruleMatch = match }
-        let desired = match?.targets ?? [:]
-        ruleTriggered = Set(desired.keys)
+        var desired = (match?.targets ?? [:]).filter { !thermalOverrides.contains($0.key) }
+        // Ignore tiny sample-to-sample changes without delaying large thermal rises.
+        for (fan, rpm) in desired {
+            if let previous = ruleApplied[fan], abs(previous - rpm) < 100 { desired[fan] = previous }
+        }
 
         // A fan neither wanted nor held by a rule has nothing to remember.
         for fan in Array(ruleApplied.keys) where desired[fan] == nil && !ruleOwned.contains(fan) {
@@ -563,7 +610,7 @@ private final class FanModel: ObservableObject {
 
         let plan = ProcessRulePlan.make(
             desired: desired, applied: ruleApplied, owned: ruleOwned, knownFans: Set(fans.map(\.id)),
-            startupSettings: startupSettings
+            startupSettings: TemperatureSource.cpuCelsius(temperatures) == nil ? [:] : startupSettings
         )
         guard !plan.isEmpty else { return }
         if !plan.releases.isEmpty, !(Self.supportsArchitecture && !Self.isTranslated) { return }
@@ -811,21 +858,22 @@ private struct MenuBarLabel: View {
 
 private struct FanMenuView: View {
     @ObservedObject var model: FanModel
+    @Environment(\.openWindow) private var openWindow
     @State private var showingMaintenanceGuide = false
     @State private var touchBarFanID = 0
     @AppStorage("refreshInterval") private var refreshInterval = FanModel.defaultRefreshInterval
     @AppStorage("statusDisplayMode") private var statusDisplayMode = "fan"
 
-    // Each fan's reachable span, so a per-fan rule slider uses that fan's own limits.
-    private var ruleFanRanges: [RuleFanRange] {
-        model.fans.map(model.controlSnapshot).map {
-            RuleFanRange(id: $0.id, lower: Int(ceil($0.minimumRPM)), upper: Int(floor($0.maximumRPM)))
-        }
+    private func openControlCenter(page: ControlPage) {
+        model.controlPage = page
+        openWindow(id: "control")
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
+                Button("控制中心") { openControlCenter(page: .overview) }
                 Label("MFan", systemImage: "fan.fill")
                     .font(.headline)
                 Spacer()
@@ -878,17 +926,12 @@ private struct FanMenuView: View {
                     )
                 }
 
-                ProcessRulesSection(
-                    rules: model.processRules,
+                ActiveRulesSummary(
                     match: model.ruleMatch,
-                    fans: ruleFanRanges,
-                    busy: model.busy,
+                    rules: model.processRules,
+                    thermal: model.thermalConfiguration,
                     cpuTemperature: TemperatureSource.cpuCelsius(model.temperatures),
-                    add: { model.addProcessRule(name: $0, rpm: $1, fanID: $2, triggerTemp: $3) },
-                    remove: { model.removeProcessRule(id: $0) },
-                    setEnabled: { model.setProcessRule(id: $0, enabled: $1) },
-                    setRPM: { model.setProcessRule(id: $0, rpm: $1) },
-                    setTriggerTemp: { model.setProcessRule(id: $0, triggerTemp: $1) }
+                    open: { openControlCenter(page: .rules) }
                 )
             }
 
@@ -977,7 +1020,7 @@ private struct FanMenuView: View {
         .padding(12)
         .frame(width: 330)
         .onAppear { model.refresh() }
-        .background(TouchBarInstaller(model: model).frame(width: 0, height: 0))
+
     }
 }
 
@@ -986,133 +1029,31 @@ private struct FanMenuView: View {
 private struct TouchBarInstaller: NSViewRepresentable {
     let model: FanModel
 
-    func makeNSView(context: Context) -> NSView {
-        let view = NSView()
-        context.coordinator.start(model: model)
+    func makeNSView(context: Context) -> TouchBarHostView {
+        let view = TouchBarHostView()
+        view.coordinator.model = model
         return view
     }
 
-    func updateNSView(_ nsView: NSView, context: Context) {
-        context.coordinator.model = model
-        context.coordinator.refresh()
+    func updateNSView(_ view: TouchBarHostView, context: Context) {
+        view.coordinator.model = model
+        view.coordinator.refresh()
     }
 
-    func makeCoordinator() -> TouchBarCoordinator { TouchBarCoordinator() }
-}
-
-@MainActor
-private final class TouchBarCoordinator: NSObject, NSTouchBarDelegate {
-    weak var model: FanModel?
-    private var observer: NSObjectProtocol?
-    private weak var installedWindow: NSWindow?
-    private var selectedFanID = 0
-    private var segmented = NSSegmentedControl()
-    private var slider = NSSlider()
-    private var valueLabel = NSTextField(labelWithString: "")
-    private var restoreButton = NSButton(title: "恢复自动", target: nil, action: nil)
-
-    func start(model: FanModel) {
-        self.model = model
-        observer = NotificationCenter.default.addObserver(
-            forName: NSWindow.didBecomeKeyNotification, object: nil, queue: .main
-        ) { [weak self] notification in
-            guard let window = notification.object as? NSWindow else { return }
-            Task { @MainActor [weak self] in
-                self?.install(on: window)
-            }
-        }
-    }
-
-    deinit {
-        if let observer { NotificationCenter.default.removeObserver(observer) }
-    }
-
-    func refresh() {
-        guard let model else { return }
-        let ids = model.fans.map(\.id)
-        if !ids.contains(selectedFanID), let first = ids.first { selectedFanID = first }
-        segmented.segmentCount = ids.count
-        for (index, id) in ids.enumerated() {
-            segmented.setLabel("风扇 \(id)", forSegment: index)
-        }
-        guard let fan = model.fans.first(where: { $0.id == selectedFanID }) else {
-            slider.isEnabled = false
-            restoreButton.isEnabled = false
-            valueLabel.stringValue = "无风扇数据"
-            return
-        }
-        let snapshot = model.controlSnapshot(fan)
-        let lower = ceil(snapshot.minimumRPM)
-        let upper = floor(snapshot.maximumRPM)
-        slider.minValue = lower
-        slider.maxValue = max(lower, upper)
-        slider.doubleValue = min(slider.maxValue, max(lower, snapshot.targetRPM ?? snapshot.currentRPM))
-        slider.isEnabled = !model.busy && upper > lower
-        restoreButton.isEnabled = !model.busy
-        valueLabel.stringValue = "\(Int(slider.doubleValue.rounded())) RPM"
-    }
-
-    private func install(on window: NSWindow) {
-        guard window.isVisible else { return }
-        installedWindow = window
-        window.touchBar = makeTouchBar()
-        refresh()
-    }
-
-    private func makeTouchBar() -> NSTouchBar {
-        segmented = NSSegmentedControl(labels: [], trackingMode: .selectOne, target: self, action: #selector(selectFan(_:)))
-        segmented.segmentStyle = .texturedRounded
-        slider = NSSlider(target: self, action: #selector(commitSpeed(_:)))
-        slider.isContinuous = false
-        valueLabel = NSTextField(labelWithString: "")
-        valueLabel.alignment = .right
-        valueLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .regular)
-        restoreButton = NSButton(title: "恢复自动", target: self, action: #selector(restoreAutomatic(_:)))
-        let bar = NSTouchBar()
-        bar.delegate = self
-        bar.defaultItemIdentifiers = [.fanSelector, .fanSlider, .fanValue, .fanRestore]
-        return bar
-    }
-
-    func touchBar(_ touchBar: NSTouchBar, makeItemForIdentifier identifier: NSTouchBarItem.Identifier) -> NSTouchBarItem? {
-        let item = NSCustomTouchBarItem(identifier: identifier)
-        switch identifier {
-        case .fanSelector:
-            item.view = segmented
-        case .fanSlider:
-            item.view = slider
-        case .fanValue:
-            item.view = valueLabel
-        case .fanRestore:
-            item.view = restoreButton
-        default:
-            return nil
-        }
-        return item
-    }
-
-    @objc private func selectFan(_ sender: NSSegmentedControl) {
-        guard sender.selectedSegment >= 0 else { return }
-        selectedFanID = model?.fans[sender.selectedSegment].id ?? selectedFanID
-        refresh()
-    }
-
-    @objc private func commitSpeed(_ sender: NSSlider) {
-        guard let model, let fan = model.fans.first(where: { $0.id == selectedFanID }), !model.busy else { return }
-        model.set(fanID: fan.id, rpm: Int(sender.doubleValue.rounded()), seconds: 0)
-    }
-
-    @objc private func restoreAutomatic(_ sender: NSButton) {
-        model?.restoreAutomatic(fanID: selectedFanID)
+    static func dismantleNSView(_ view: TouchBarHostView, coordinator: ()) {
+        view.coordinator.detach()
     }
 }
 
-private extension NSTouchBarItem.Identifier {
-    static let fanSelector = NSTouchBarItem.Identifier("local.mfan.fan-selector")
-    static let fanSlider = NSTouchBarItem.Identifier("local.mfan.fan-slider")
-    static let fanValue = NSTouchBarItem.Identifier("local.mfan.fan-value")
-    static let fanRestore = NSTouchBarItem.Identifier("local.mfan.fan-restore")
+private final class TouchBarHostView: NSView {
+    let coordinator = TouchBarCoordinator()
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        coordinator.detach()
+        if let window { coordinator.install(on: window) }
+    }
 }
+
 
 private struct FanMenuRow: View {
     let fan: FanSnapshot

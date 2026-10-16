@@ -3,6 +3,7 @@ import FanCore
 
 struct TemperatureSection: View {
     let temperatures: [TemperatureSnapshot]
+    var showsTitle = true
 
     private var visibleTemperatures: [TemperatureSnapshot] {
         let preferred = ["CPU Die", "CPU Proximity", "GPU Die", "GPU Proximity", "Heatsink", "Memory"]
@@ -15,9 +16,11 @@ struct TemperatureSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("温度")
-                .font(.caption.weight(.medium))
-                .foregroundStyle(.secondary)
+            if showsTitle {
+                Text("温度")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+            }
             ForEach(visibleTemperatures) { temperature in
                 HStack(spacing: 6) {
                     Image(systemName: icon(for: temperature.name))

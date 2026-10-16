@@ -7,9 +7,9 @@ final class FanSafetyTests: XCTestCase {
         FanSnapshot(id: 0, currentRPM: current, minimumRPM: 1200, maximumRPM: max, targetRPM: target)
     }
 
-    func testWarnsAtExactlySeventyFivePercentWhenUnlimited() {
-        XCTAssertTrue(FanSafety.showsHighSpeedWarning(fan: fan(current: 4500), heldUnlimited: true))
-        XCTAssertFalse(FanSafety.showsHighSpeedWarning(fan: fan(current: 4499), heldUnlimited: true))
+    func testWarnsAtExactlyEightyFivePercentWhenUnlimited() {
+        XCTAssertTrue(FanSafety.showsHighSpeedWarning(fan: fan(current: 5100), heldUnlimited: true))
+        XCTAssertFalse(FanSafety.showsHighSpeedWarning(fan: fan(current: 5099), heldUnlimited: true))
     }
 
     func testNoWarningWhenNotHeldUnlimited() {
@@ -17,7 +17,7 @@ final class FanSafetyTests: XCTestCase {
     }
 
     func testHighTargetWarnsBeforeFanSpinsUp() {
-        XCTAssertTrue(FanSafety.showsHighSpeedWarning(fan: fan(current: 2000, target: 5000), heldUnlimited: true))
+        XCTAssertTrue(FanSafety.showsHighSpeedWarning(fan: fan(current: 2000, target: 5400), heldUnlimited: true))
     }
 
     func testInvalidMaximumNeverWarns() {

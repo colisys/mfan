@@ -5,36 +5,47 @@ enum RuleTemperature {
     static let range = 40...100
     static let step = 5
     static let defaultCelsius = 80
-    /// Once fired, a rule holds until the CPU falls this far below its threshold,
-    /// so the fan does not flap on and off around the threshold.
-    static let hysteresis = 5.0
 }
 
-/// "While this process runs (and/or the CPU is hot enough), hold the fan(s) at `rpm`."
+/// Persisted rule. The high-temperature target is `percent` of each fan's own usable
+/// range, so fans with different limits (e.g. CPU side vs GPU side) scale separately.
+/// Rules saved before that decode with `percent == nil` and keep their absolute `rpm`,
+/// clamped per fan.
 struct ProcessRule: Codable, Identifiable, Equatable {
     var id: UUID
     var name: String
+    /// Legacy absolute high-temperature target; unused (0) once `percent` is set.
     var rpm: Int
     var enabled: Bool
     /// nil applies to every fan. Rules saved before per-fan support decode as nil.
     var fanID: Int?
-    /// CPU °C at which the rule fires. nil fires as soon as the process runs.
+    /// Starting CPU °C for continuous control; nil uses 40°C in ThermalResolver.
     /// Rules saved before temperature support decode as nil.
     var triggerTemp: Int?
+    /// High-temperature target as a share (1–100) of each fan's minimum-to-maximum range.
+    var percent: Int?
 
     init(id: UUID = UUID(), name: String, rpm: Int, enabled: Bool = true, fanID: Int? = nil,
-         triggerTemp: Int? = nil) {
+         triggerTemp: Int? = nil, percent: Int? = nil) {
         self.id = id
         self.name = name
         self.rpm = rpm
         self.enabled = enabled
         self.fanID = fanID
         self.triggerTemp = triggerTemp
+        self.percent = percent
     }
 
     /// An empty name means no process condition: the rule depends on temperature alone.
     var isTemperatureOnly: Bool { ProcessRuleResolver.normalized(name).isEmpty }
     var displayName: String { isTemperatureOnly ? "温度触发" : name }
+
+    var isValid: Bool {
+        let validTemperature = triggerTemp.map { (20...120).contains($0) } ?? true
+        let validTarget = percent.map { (1...100).contains($0) } ?? (rpm > 0)
+        return validTemperature && (!isTemperatureOnly || triggerTemp != nil)
+            && validTarget && (fanID ?? 0) >= 0
+    }
 }
 
 enum ProcessRuleStore {
@@ -43,16 +54,11 @@ enum ProcessRuleStore {
     static func load(from defaults: UserDefaults = .standard) -> [ProcessRule] {
         guard let data = defaults.data(forKey: defaultsKey),
               let rules = try? JSONDecoder().decode([ProcessRule].self, from: data) else { return [] }
-        return rules.filter { rule in
-            let validTemperature = rule.triggerTemp.map { (20...120).contains($0) } ?? true
-            // A rule needs a process, a temperature, or both.
-            let hasCondition = !rule.isTemperatureOnly || rule.triggerTemp != nil
-            return validTemperature && hasCondition && rule.rpm > 0 && (rule.fanID ?? 0) >= 0
-        }
+        return rules.filter(\.isValid)
     }
 
     static func save(_ rules: [ProcessRule], to defaults: UserDefaults = .standard) {
-        guard let data = try? JSONEncoder().encode(rules) else { return }
+        guard let data = try? JSONEncoder().encode(rules.filter(\.isValid)) else { return }
         defaults.set(data, forKey: defaultsKey)
     }
 }
@@ -84,53 +90,6 @@ enum ProcessRuleResolver {
         var value = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if value.hasSuffix(".app") { value.removeLast(4) }
         return value
-    }
-
-    /// Per fan, every live rule (process running, or temperature-only) joins one
-    /// effective rule with the LOWEST trigger temperature and the HIGHEST RPM. A rule
-    /// without a temperature fires at launch, which counts as the lowest threshold.
-    /// A rule with a nil `fanID` applies to every fan in `fanIDs`; one for an unknown
-    /// fan is inert. `wasTriggered` adds hysteresis for fans already held.
-    static func resolve(
-        rules: [ProcessRule], running: Set<String>, fanIDs: [Int],
-        temperature: Double? = nil, wasTriggered: Set<Int> = []
-    ) -> ProcessRuleMatch? {
-        let normalizedRunning = Set(running.map(normalized))
-        let live = rules.filter {
-            $0.enabled && $0.rpm > 0 && ($0.isTemperatureOnly
-                ? $0.triggerTemp != nil
-                : normalizedRunning.contains(normalized($0.name)))
-        }
-        var targets: [Int: Int] = [:]
-        var winners: [String] = []
-        var active = Set<UUID>()
-        var armed = Set<UUID>()
-        for fan in fanIDs {
-            let applicable = live.filter { $0.fanID == nil || $0.fanID == fan }
-            guard let top = applicable.map(\.rpm).max() else { continue }
-            let threshold: Int? = applicable.contains { $0.triggerTemp == nil }
-                ? nil : applicable.compactMap(\.triggerTemp).min()
-            let fires: Bool
-            if let threshold {
-                let release = wasTriggered.contains(fan) ? RuleTemperature.hysteresis : 0
-                // An unreadable temperature never fires a temperature condition.
-                fires = (temperature ?? -.infinity) >= Double(threshold) - release
-            } else {
-                fires = true
-            }
-            if fires {
-                targets[fan] = top
-                for rule in applicable {
-                    active.insert(rule.id)
-                    if rule.rpm == top && !winners.contains(rule.displayName) { winners.append(rule.displayName) }
-                }
-            } else {
-                armed.formUnion(applicable.map(\.id))
-            }
-        }
-        armed.subtract(active)
-        guard !targets.isEmpty || !armed.isEmpty else { return nil }
-        return ProcessRuleMatch(targets: targets, winners: winners, activeIDs: active, armedIDs: armed)
     }
 }
 
