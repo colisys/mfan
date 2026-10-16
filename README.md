@@ -46,3 +46,10 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test
 ```
 
 构建与测试需串行执行（SwiftPM 构建数据库不支持并行）。更新版本前，先在旧面板恢复自动并正常退出，重新打包不会升级已运行的旧服务。
+
+## 致谢
+
+感谢以下开源项目提供的启发与参考：
+
+- [Stats](https://github.com/exelban/stats)：开源 macOS 系统监控与菜单栏控制面板。
+- [MacFanControl](https://github.com/achen4020/MacFanControl)：开源 macOS 风扇控制项目。
