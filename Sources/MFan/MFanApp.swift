@@ -17,15 +17,15 @@ struct MFanApp: App {
 }
 
 private enum FanError: LocalizedError {
-    case invalidSnapshot
+    case invalidSnapshot(String)
     case missingCLI
     case controlServiceUnavailable
     case controlRequestFailed(String)
 
     var errorDescription: String? {
         switch self {
-        case .invalidSnapshot:
-            return "SMC 返回了无效的风扇数据。"
+        case .invalidSnapshot(let details):
+            return "SMC 返回了无效的风扇数据：\(details)"
         case .missingCLI:
             return "找不到应用内的 fanctl，请使用打包脚本构建应用。"
         case .controlServiceUnavailable:
@@ -52,7 +52,13 @@ private final class FanReader {
                 ceil($0.minimumRPM) <= floor($0.maximumRPM) &&
                 ($0.targetRPM.map { $0.isFinite && $0 >= 0 } ?? true)
             }
-            guard valid else { throw FanError.invalidSnapshot }
+            guard valid else {
+                let details = fans.map { fan -> String in
+                    let target = fan.targetRPM.map { String($0) } ?? "nil"
+                    return "#\(fan.id): 当前=\(fan.currentRPM), 最小=\(fan.minimumRPM), 最大=\(fan.maximumRPM), 目标=\(target)"
+                }.joined(separator: "；")
+                throw FanError.invalidSnapshot(details)
+            }
             let temperatures = try client!.temperatures()
             return (fans.sorted { $0.id < $1.id }, temperatures)
         } catch {
@@ -116,7 +122,7 @@ private final class FanModel: ObservableObject {
     private let serviceID = UUID().uuidString
     private var reading = false
     private var timer: DispatchSourceTimer?
-    private var startupSettingAttempted = false
+    private var startupSettingAttempted = Set<Int>()
     private var heartbeatTimer: DispatchSourceTimer?
     private var statusTimer: DispatchSourceTimer?
     private var heartbeatActivity: NSObjectProtocol?
@@ -257,15 +263,43 @@ private final class FanModel: ObservableObject {
     }
 
     private func applyStartupSettingIfNeeded() {
-        guard !startupSettingAttempted,
-              UserDefaults.standard.bool(forKey: "startupFanEnabled"),
-              let fan = fans.first(where: { $0.id == UserDefaults.standard.integer(forKey: "startupFanID") }) else { return }
-        let configuredRPM = UserDefaults.standard.double(forKey: "startupFanRPM")
-        guard configuredRPM.isFinite else { return }
-        let rpm = Int(min(floor(fan.maximumRPM), max(ceil(fan.minimumRPM), configuredRPM)))
-        guard rpm > 0 else { return }
-        startupSettingAttempted = true
-        set(fanID: fan.id, rpm: rpm, seconds: 0)
+        for fan in fans where !startupSettingAttempted.contains(fan.id) {
+            // Control sessions are serialized; leave remaining startup settings
+            // for the refresh triggered when the current write completes.
+            guard !busy else { return }
+            guard let configuredRPM = startupRPM(for: fan.id), configuredRPM.isFinite else { continue }
+            let rpm = Int(min(floor(fan.maximumRPM), max(ceil(fan.minimumRPM), configuredRPM)))
+            guard rpm > 0 else { continue }
+            startupSettingAttempted.insert(fan.id)
+            set(fanID: fan.id, rpm: rpm, seconds: 0)
+        }
+    }
+
+    func startupRPM(for fanID: Int) -> Double? {
+        let defaults = UserDefaults.standard
+        if let settings = defaults.dictionary(forKey: "startupFanSettings") as? [String: Double],
+           let rpm = settings[String(fanID)], rpm.isFinite, rpm > 0 {
+            return rpm
+        }
+        // Migrate the old single-fan setting when no new settings exist yet.
+        guard defaults.bool(forKey: "startupFanEnabled"),
+              defaults.integer(forKey: "startupFanID") == fanID else { return nil }
+        let rpm = defaults.double(forKey: "startupFanRPM")
+        return rpm.isFinite && rpm > 0 ? rpm : nil
+    }
+
+    func setStartup(fanID: Int, rpm: Int) {
+        var settings = UserDefaults.standard.dictionary(forKey: "startupFanSettings") as? [String: Double] ?? [:]
+        settings[String(fanID)] = Double(rpm)
+        UserDefaults.standard.set(settings, forKey: "startupFanSettings")
+        objectWillChange.send()
+    }
+
+    func cancelStartup(fanID: Int) {
+        var settings = UserDefaults.standard.dictionary(forKey: "startupFanSettings") as? [String: Double] ?? [:]
+        settings.removeValue(forKey: String(fanID))
+        UserDefaults.standard.set(settings, forKey: "startupFanSettings")
+        objectWillChange.send()
     }
 
     private func refreshLinkState() {
@@ -343,7 +377,16 @@ private final class FanModel: ObservableObject {
         }
     }
 
-    func restoreAutomatic() {
+    func restoreAutomatic(fanID: Int) {
+        guard !busy, Self.supportsArchitecture, !Self.isTranslated else { return }
+        ruleOwned.remove(fanID)
+        execute(
+            request: FanControlRequest(command: "auto", fan: fanID),
+            description: "正在恢复风扇 #\(fanID) 的自动控制…"
+        )
+    }
+
+    func restoreAllAutomatic() {
         guard !busy, Self.supportsArchitecture, !Self.isTranslated else { return }
         ruleOwned.removeAll()
         execute(
@@ -520,7 +563,7 @@ private final class FanModel: ObservableObject {
 
         let plan = ProcessRulePlan.make(
             desired: desired, applied: ruleApplied, owned: ruleOwned, knownFans: Set(fans.map(\.id)),
-            startup: startupSetting
+            startupSettings: startupSettings
         )
         guard !plan.isEmpty else { return }
         if !plan.releases.isEmpty, !(Self.supportsArchitecture && !Self.isTranslated) { return }
@@ -567,13 +610,21 @@ private final class FanModel: ObservableObject {
         }
     }
 
-    /// The saved startup setting, if enabled and usable.
-    private var startupSetting: (fan: Int, rpm: Int)? {
-        let defaults = UserDefaults.standard
-        guard defaults.bool(forKey: "startupFanEnabled") else { return nil }
-        let rpm = defaults.double(forKey: "startupFanRPM")
-        guard rpm.isFinite, rpm > 0 else { return nil }
-        return (defaults.integer(forKey: "startupFanID"), Int(rpm))
+    /// All saved per-fan startup settings, including the legacy single-fan value.
+    private var startupSettings: [Int: Int] {
+        var result: [Int: Int] = [:]
+        if let settings = UserDefaults.standard.dictionary(forKey: "startupFanSettings") as? [String: Double] {
+            for (key, value) in settings {
+                if let fan = Int(key), value.isFinite, value > 0 { result[fan] = Int(value) }
+            }
+        }
+        if result.isEmpty,
+           UserDefaults.standard.bool(forKey: "startupFanEnabled") {
+            let fan = UserDefaults.standard.integer(forKey: "startupFanID")
+            let rpm = UserDefaults.standard.double(forKey: "startupFanRPM")
+            if rpm.isFinite, rpm > 0 { result[fan] = Int(rpm) }
+        }
+        return result
     }
 
     private func rescheduleStatusTimer() {
@@ -761,9 +812,6 @@ private struct MenuBarLabel: View {
 private struct FanMenuView: View {
     @ObservedObject var model: FanModel
     @State private var showingMaintenanceGuide = false
-    @AppStorage("startupFanEnabled") private var startupFanEnabled = false
-    @AppStorage("startupFanID") private var startupFanID = 0
-    @AppStorage("startupFanRPM") private var startupFanRPM = 0.0
     @AppStorage("refreshInterval") private var refreshInterval = FanModel.defaultRefreshInterval
     @AppStorage("statusDisplayMode") private var statusDisplayMode = "fan"
 
@@ -812,17 +860,20 @@ private struct FanMenuView: View {
                         fan: model.controlSnapshot(fan),
                         busy: model.busy,
                         heldUnlimited: model.unlimitedFans.contains(fan.id),
-                        startupEnabled: startupFanEnabled && startupFanID == fan.id,
-                        startupFanRPM: startupFanRPM,
+                        startupEnabled: model.startupRPM(for: fan.id) != nil,
+                        startupFanRPM: model.startupRPM(for: fan.id) ?? 0,
                         set: { rpm, seconds in
                             model.set(fanID: fan.id, rpm: rpm, seconds: seconds)
                         },
-                        setStartup: { rpm in
-                            startupFanEnabled = true
-                            startupFanID = fan.id
-                            startupFanRPM = Double(rpm)
+                        restoreAutomatic: {
+                            model.restoreAutomatic(fanID: fan.id)
                         },
-                        cancelStartup: { startupFanEnabled = false }
+                        setStartup: { rpm in
+                            model.setStartup(fanID: fan.id, rpm: rpm)
+                        },
+                        cancelStartup: {
+                            model.cancelStartup(fanID: fan.id)
+                        }
                     )
                 }
 
@@ -868,8 +919,8 @@ private struct FanMenuView: View {
             Divider()
 
             HStack {
-                Button("恢复自动") {
-                    model.restoreAutomatic()
+                Button("全部恢复自动") {
+                    model.restoreAllAutomatic()
                 }
                 .controlSize(.small)
                 .disabled(model.busy || !FanModel.supportsArchitecture)
@@ -925,6 +976,7 @@ private struct FanMenuRow: View {
     let startupEnabled: Bool
     let startupFanRPM: Double
     let set: (Int, Int) -> Void
+    let restoreAutomatic: () -> Void
     let setStartup: (Int) -> Void
     let cancelStartup: () -> Void
     @State private var rpm: Double
@@ -939,6 +991,7 @@ private struct FanMenuRow: View {
         startupEnabled: Bool,
         startupFanRPM: Double,
         set: @escaping (Int, Int) -> Void,
+        restoreAutomatic: @escaping () -> Void,
         setStartup: @escaping (Int) -> Void,
         cancelStartup: @escaping () -> Void
     ) {
@@ -948,6 +1001,7 @@ private struct FanMenuRow: View {
         self.startupEnabled = startupEnabled
         self.startupFanRPM = startupFanRPM
         self.set = set
+        self.restoreAutomatic = restoreAutomatic
         self.setStartup = setStartup
         self.cancelStartup = cancelStartup
         let initial = fan.targetRPM ?? fan.currentRPM
@@ -999,6 +1053,8 @@ private struct FanMenuRow: View {
                 Spacer()
 
                 Button("设定") { set(snappedRPM, seconds) }
+                    .controlSize(.small)
+                Button("恢复自动") { restoreAutomatic() }
                     .controlSize(.small)
             }
 

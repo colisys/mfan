@@ -109,6 +109,7 @@ public final class SMCClient {
     private func snapshot(index: Int, fanCount: Int) throws -> FanSnapshot {
         guard index >= 0, index < fanCount else { throw FanError.invalidFanIndex(index) }
         let current = try readFanSpeed("F\(index)Ac") ?? 0
+        // Some Intel SMC revisions expose fan limits using different types.
         let min = try readFanSpeed("F\(index)Mn") ?? 0
         let max = try readFanSpeed("F\(index)Mx") ?? 0
         let target = try readFanSpeed("F\(index)Tg")
@@ -180,13 +181,22 @@ public final class SMCClient {
     // MARK: - 读取
 
     private func readFanSpeed(_ key: String) throws -> Double? {
-        guard let (type, data) = try readKey(key), data.count >= 2 else { return nil }
+        guard let (type, data) = try readKey(key) else { return nil }
         switch type {
         case "fpe2", "fpes": // 2 位小数定点，大端
+            guard data.count >= 2 else { return nil }
             let raw = (UInt16(data[0]) << 8) | UInt16(data[1])
             return Double(raw) / 4.0
         case "ui16", "u16 ":
+            guard data.count >= 2 else { return nil }
             let raw = (UInt16(data[0]) << 8) | UInt16(data[1])
+            return Double(raw)
+        case "flt ":
+            return decodeFloat32(data)
+        case "ui32", "u32 ":
+            guard data.count >= 4 else { return nil }
+            let raw = UInt32(data[0]) << 24 | UInt32(data[1]) << 16 |
+                UInt32(data[2]) << 8 | UInt32(data[3])
             return Double(raw)
         default:
             return nil
@@ -209,13 +219,19 @@ public final class SMCClient {
         case "ui16", "u16 ":
             return Double(raw16)
         case "flt ":
-            guard data.count >= 4 else { return nil }
-            let bits = UInt32(data[0]) << 24 | UInt32(data[1]) << 16 |
-                UInt32(data[2]) << 8 | UInt32(data[3])
-            return Double(Float(bitPattern: bits))
+            return decodeFloat32(data)
         default:
             return nil
         }
+    }
+
+    private func decodeFloat32(_ data: Data) -> Double? {
+        guard data.count >= 4 else { return nil }
+        // AppleSMC stores `flt ` payloads in native/little-endian byte order
+        // on the affected Intel/T2 machines.
+        let bits = UInt32(data[0]) | UInt32(data[1]) << 8 |
+            UInt32(data[2]) << 16 | UInt32(data[3]) << 24
+        return Double(Float(bitPattern: bits))
     }
 
     /// 返回 (dataType 四字符, 数据)。键不存在返回 nil。
@@ -255,30 +271,73 @@ public final class SMCClient {
         try _readKey(key)?.1
     }
 
+    private struct SMCKeyInfo {
+        let size: Int
+        let type: String
+        let rawType: UInt32
+    }
+
+    private func readKeyInfo(_ key: String) throws -> SMCKeyInfo? {
+        var input = SMCParamStruct()
+        input.key = fourCC(key)
+        input.data8 = UInt8(kSMCReadKeyInfo)
+        var output = SMCParamStruct()
+        try call(&input, &output, key: key)
+        guard output.result == UInt8(kSMCSuccess) else {
+            if output.result == UInt8(kSMCKeyNotFound) { return nil }
+            throw FanError.readFailed(key, "SMC 命令 \(kSMCReadKeyInfo) 返回 result=0x\(String(output.result, radix: 16))。")
+        }
+        return SMCKeyInfo(size: Int(output.keyInfo.dataSize),
+                          type: unFourCC(output.keyInfo.dataType),
+                          rawType: output.keyInfo.dataType)
+    }
+
     // MARK: - 写入
 
     private func writeFanSpeed(_ key: String, rpm: Double) throws {
-        let raw = UInt16(clamping: Int((max(0, rpm) * 4).rounded()))
-        try queue.sync {
-            var input = SMCParamStruct()
-            input.key = fourCC(key)
-            input.data8 = UInt8(kSMCWriteBytes)
-            input.keyInfo.dataSize = 2
-            input.bytes.0 = UInt8(raw >> 8)
-            input.bytes.1 = UInt8(raw & 0xFF)
-            var output = SMCParamStruct()
-            try call(&input, &output, key: key)
-            guard output.result == UInt8(kSMCSuccess) else { throw FanError.writeFailed(key, output.result) }
+        guard let info = try readKeyInfo(key) else { throw FanError.keyNotFound(key) }
+        let bytes: [UInt8]
+        switch info.type {
+        case "fpe2", "fpes":
+            let raw = UInt16(clamping: Int((max(0, rpm) * 4).rounded()))
+            bytes = [UInt8(raw >> 8), UInt8(raw & 0xFF)]
+        case "flt ":
+            let value = Float(rpm)
+            let raw = value.bitPattern
+            // The affected Intel/T2 SMC exposes flt payloads little-endian.
+            bytes = [UInt8(raw & 0xFF), UInt8((raw >> 8) & 0xFF),
+                     UInt8((raw >> 16) & 0xFF), UInt8((raw >> 24) & 0xFF)]
+        case "ui16", "u16 ":
+            let raw = UInt16(clamping: Int(max(0, rpm).rounded()))
+            bytes = [UInt8(raw >> 8), UInt8(raw & 0xFF)]
+        case "ui32", "u32 ":
+            let raw = UInt32(clamping: Int(max(0, rpm).rounded()))
+            bytes = [UInt8(raw >> 24), UInt8((raw >> 16) & 0xFF),
+                     UInt8((raw >> 8) & 0xFF), UInt8(raw & 0xFF)]
+        default:
+            throw FanError.readFailed(key, "不支持的 SMC 写入类型 \(info.type)")
         }
+        try writeKey(key, info: info, bytes: bytes)
     }
 
     private func writeFlag(_ key: String, value: UInt8) throws {
+        guard let info = try readKeyInfo(key) else { throw FanError.keyNotFound(key) }
+        try writeKey(key, info: info, bytes: [value])
+    }
+
+    private func writeKey(_ key: String, info: SMCKeyInfo, bytes: [UInt8]) throws {
+        guard bytes.count == info.size else {
+            throw FanError.readFailed(key, "SMC 键类型 \(info.type) 需要 \(info.size) 字节，实际准备了 \(bytes.count) 字节")
+        }
         try queue.sync {
             var input = SMCParamStruct()
             input.key = fourCC(key)
             input.data8 = UInt8(kSMCWriteBytes)
-            input.keyInfo.dataSize = 1
-            input.bytes.0 = value
+            input.keyInfo.dataSize = UInt32(info.size)
+            input.keyInfo.dataType = info.rawType
+            withUnsafeMutableBytes(of: &input.bytes) { destination in
+                destination.copyBytes(from: bytes)
+            }
             var output = SMCParamStruct()
             try call(&input, &output, key: key)
             guard output.result == UInt8(kSMCSuccess) else { throw FanError.writeFailed(key, output.result) }

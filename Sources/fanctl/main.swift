@@ -53,7 +53,7 @@ do {
         guard rpm.isFinite, snap.minimumRPM.isFinite, snap.maximumRPM.isFinite,
               snap.minimumRPM >= 0, snap.maximumRPM > 0,
               snap.minimumRPM <= snap.maximumRPM else {
-            print("错误：RPM 或风扇硬件转速范围无效")
+            print("错误：风扇硬件转速范围无效（当前=\(snap.currentRPM)，最小=\(snap.minimumRPM)，最大=\(snap.maximumRPM)）。此机型可能不支持通过 AppleSMC 读取或控制风扇。")
             exit(1)
         }
         // Tachometer overshoot is not a target limit; use the hardware range.
