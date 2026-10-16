@@ -137,20 +137,25 @@ struct ProcessRulesSection: View {
                         }
                     }
 
-                    ForEach(rules) { rule in
-                        let ruleBounds = Self.bounds(for: rule.fanID, in: fans)
-                        ProcessRuleRow(
-                            rule: rule,
-                            isActive: match?.activeIDs.contains(rule.id) ?? false,
-                            isArmed: match?.armedIDs.contains(rule.id) ?? false,
-                            lower: ruleBounds.lower,
-                            upper: ruleBounds.upper,
-                            remove: { remove(rule.id) },
-                            setEnabled: { setEnabled(rule.id, $0) },
-                            setRPM: { setRPM(rule.id, $0) },
-                            setTriggerTemp: { setTriggerTemp(rule.id, $0) }
-                        )
+                    ScrollView(.vertical) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            ForEach(rules) { rule in
+                                let ruleBounds = Self.bounds(for: rule.fanID, in: fans)
+                                ProcessRuleRow(
+                                    rule: rule,
+                                    isActive: match?.activeIDs.contains(rule.id) ?? false,
+                                    isArmed: match?.armedIDs.contains(rule.id) ?? false,
+                                    lower: ruleBounds.lower,
+                                    upper: ruleBounds.upper,
+                                    remove: { remove(rule.id) },
+                                    setEnabled: { setEnabled(rule.id, $0) },
+                                    setRPM: { setRPM(rule.id, $0) },
+                                    setTriggerTemp: { setTriggerTemp(rule.id, $0) }
+                                )
+                            }
+                        }
                     }
+                    .frame(maxHeight: 132)
 
                     addForm
                 }
@@ -242,9 +247,15 @@ struct ProcessRulesSection: View {
             }
             HStack {
                 Spacer()
-                Button("添加规则", action: commitNew)
-                    .controlSize(.small)
-                    .disabled(!canAdd)
+                Button(action: commitNew) {
+                    Text("添加规则")
+                        .font(.caption)
+                        .foregroundStyle(.primary)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .fixedSize()
+                .disabled(!canAdd)
             }
         }
     }
