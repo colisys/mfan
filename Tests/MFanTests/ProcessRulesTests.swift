@@ -1,3 +1,4 @@
+import FanCore
 import XCTest
 @testable import MFan
 
@@ -139,6 +140,108 @@ final class ProcessRulesTests: XCTestCase {
     func testPlanIgnoresUnknownFans() {
         let plan = ProcessRulePlan.make(desired: [5: 3000], applied: [:], owned: [6], knownFans: [0])
         XCTAssertTrue(plan.isEmpty)
+    }
+
+    // MARK: Temperature triggers
+
+    private func resolve(
+        _ rules: [ProcessRule], running: Set<String> = [], temperature: Double?,
+        wasTriggered: Set<Int> = []
+    ) -> ProcessRuleMatch? {
+        ProcessRuleResolver.resolve(
+            rules: rules, running: running, fanIDs: fans,
+            temperature: temperature, wasTriggered: wasTriggered
+        )
+    }
+
+    func testTemperatureOnlyRuleFiresAtThreshold() {
+        let rule = ProcessRule(name: "", rpm: 4000, triggerTemp: 80)
+        XCTAssertTrue(resolve([rule], temperature: 79.9)?.targets.isEmpty ?? true)
+        XCTAssertEqual(resolve([rule], temperature: 80)?.targets, [0: 4000, 1: 4000])
+        XCTAssertEqual(resolve([rule], temperature: 80)?.winners, ["温度触发"])
+    }
+
+    func testHysteresisKeepsRuleHeldUntilTemperatureFallsBack() {
+        let rule = ProcessRule(name: "", rpm: 4000, triggerTemp: 80)
+        XCTAssertEqual(resolve([rule], temperature: 76, wasTriggered: [0, 1])?.targets.count, 2)
+        XCTAssertEqual(resolve([rule], temperature: 75, wasTriggered: [0, 1])?.targets.count, 2)
+        XCTAssertTrue(resolve([rule], temperature: 74.9, wasTriggered: [0, 1])?.targets.isEmpty ?? true)
+        XCTAssertTrue(resolve([rule], temperature: 76, wasTriggered: [])?.targets.isEmpty ?? true)
+    }
+
+    func testProcessRuleWithTemperatureWaitsThenFires() {
+        let rule = ProcessRule(name: "UTM", rpm: 4000, triggerTemp: 70)
+        let cool = resolve([rule], running: ["UTM"], temperature: 60)
+        XCTAssertTrue(cool?.targets.isEmpty ?? false)
+        XCTAssertEqual(cool?.armedIDs, [rule.id])
+        XCTAssertEqual(resolve([rule], running: ["UTM"], temperature: 70)?.targets[0], 4000)
+        // Process not running: nothing, however hot.
+        XCTAssertNil(resolve([rule], running: [], temperature: 95))
+    }
+
+    func testProcessRuleWithoutTemperatureFiresImmediately() {
+        let rule = ProcessRule(name: "UTM", rpm: 4000)
+        XCTAssertEqual(resolve([rule], running: ["UTM"], temperature: nil)?.targets[0], 4000)
+    }
+
+    func testSeveralAppsTakeLowestTemperatureAndHighestRPM() {
+        let a = ProcessRule(name: "A", rpm: 3000, triggerTemp: 70)
+        let b = ProcessRule(name: "B", rpm: 5000, triggerTemp: 85)
+        // Both running: threshold is min(70, 85) = 70, RPM is max(3000, 5000) = 5000.
+        XCTAssertTrue(resolve([a, b], running: ["A", "B"], temperature: 69)?.targets.isEmpty ?? false)
+        let hot = resolve([a, b], running: ["A", "B"], temperature: 70)
+        XCTAssertEqual(hot?.targets, [0: 5000, 1: 5000])
+        XCTAssertEqual(hot?.winners, ["B"])
+        // Only B running: its own threshold applies.
+        XCTAssertTrue(resolve([a, b], running: ["B"], temperature: 80)?.targets.isEmpty ?? false)
+        XCTAssertEqual(resolve([a, b], running: ["B"], temperature: 85)?.targets[0], 5000)
+    }
+
+    func testRuleWithoutTemperatureMakesCombinedRuleFireAtLaunch() {
+        let hotOnly = ProcessRule(name: "A", rpm: 3000, triggerTemp: 90)
+        let always = ProcessRule(name: "B", rpm: 4000)
+        let match = resolve([hotOnly, always], running: ["A", "B"], temperature: 40)
+        XCTAssertEqual(match?.targets[0], 4000)
+    }
+
+    func testUnreadableTemperatureNeverFiresTemperatureRules() {
+        let rule = ProcessRule(name: "", rpm: 4000, triggerTemp: 40)
+        XCTAssertTrue(resolve([rule], temperature: nil)?.targets.isEmpty ?? true)
+        XCTAssertEqual(resolve([rule], temperature: nil, wasTriggered: [0, 1])?.armedIDs, [rule.id])
+    }
+
+    func testTemperatureRuleOnOneFanLeavesTheOtherAlone() {
+        let rule = ProcessRule(name: "", rpm: 4000, fanID: 1, triggerTemp: 80)
+        XCTAssertEqual(resolve([rule], temperature: 85)?.targets, [1: 4000])
+    }
+
+    func testDisabledTemperatureRuleIsIgnored() {
+        let rule = ProcessRule(name: "", rpm: 4000, enabled: false, triggerTemp: 50)
+        XCTAssertNil(resolve([rule], temperature: 99))
+    }
+
+    func testCPUTemperaturePrefersDieSensor() {
+        let sensors = [
+            TemperatureSnapshot(id: "a", name: "CPU Proximity", celsius: 50),
+            TemperatureSnapshot(id: "b", name: "CPU Die", celsius: 70),
+        ]
+        XCTAssertEqual(TemperatureSource.cpuCelsius(sensors), 70)
+        XCTAssertNil(TemperatureSource.cpuCelsius([TemperatureSnapshot(id: "c", name: "Battery", celsius: 30)]))
+    }
+
+    func testTemperatureRuleStoreValidation() throws {
+        let suite = "ProcessRulesTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let tempOnly = ProcessRule(name: "", rpm: 4000, triggerTemp: 80)
+        let withApp = ProcessRule(name: "UTM", rpm: 3000, triggerTemp: 70)
+        ProcessRuleStore.save([
+            tempOnly, withApp,
+            ProcessRule(name: "", rpm: 4000),
+            ProcessRule(name: "X", rpm: 4000, triggerTemp: 5),
+            ProcessRule(name: "Y", rpm: 4000, triggerTemp: 500),
+        ], to: defaults)
+        XCTAssertEqual(ProcessRuleStore.load(from: defaults), [tempOnly, withApp])
     }
 
     // MARK: Scanner and store

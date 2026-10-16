@@ -90,11 +90,16 @@ private final class FanModel: ObservableObject {
     @Published private(set) var statusNow = ProcessInfo.processInfo.systemUptime
     @Published private(set) var processRules: [ProcessRule] = ProcessRuleStore.load()
     @Published private(set) var ruleMatch: ProcessRuleMatch?
+    // Fans last set without a time limit by this app. The service reports only the
+    // shortest deadline across fans, so "unlimited" is tracked per fan here.
+    @Published private(set) var unlimitedFans: Set<Int> = []
     // Per-fan RPM the rule engine last sent. Only updated when a request is accepted,
     // so a failed or cancelled request is not replayed on every refresh.
     private var ruleApplied: [Int: Int] = [:]
     // Fans a rule may still be holding; manual actions on a fan take it away.
     private var ruleOwned: Set<Int> = []
+    // Fans whose rule fired on the last evaluation; drives temperature hysteresis.
+    private var ruleTriggered: Set<Int> = []
     private var currentRefreshInterval: TimeInterval = {
         let saved = UserDefaults.standard.double(forKey: "refreshInterval")
         return refreshIntervals.contains(saved) ? saved : defaultRefreshInterval
@@ -199,7 +204,7 @@ private final class FanModel: ObservableObject {
         guard Self.supportsArchitecture, !Self.isTranslated, !reading else { return }
         reading = true
         let reader = self.reader
-        let scanProcesses = processRules.contains { $0.enabled }
+        let scanProcesses = processRules.contains { $0.enabled && !$0.isTemperatureOnly }
         readQueue.async { [weak self] in
             let result = Result { try reader.read() }
             let running: Set<String>? = scanProcesses ? ProcessScanner.runningNames() : nil
@@ -416,6 +421,7 @@ private final class FanModel: ObservableObject {
                         )
                     }
                     self.updateControlStatus(response)
+                    self.trackUnlimitedHold(request: request, response: response)
                     if response.success {
                         messages.append(response.message ?? "操作已完成")
                     } else {
@@ -434,20 +440,38 @@ private final class FanModel: ObservableObject {
 
     // MARK: Process rules
 
-    /// `fanID` nil applies the rule to every fan. The same process may have one
-    /// rule per target (all fans, or each individual fan).
-    func addProcessRule(name: String, rpm: Int, fanID: Int?) {
+    /// `fanID` nil applies the rule to every fan. An empty `name` makes a
+    /// temperature-only rule, which then requires `triggerTemp`. The same process may
+    /// have one rule per target (all fans, or each individual fan).
+    func addProcessRule(name: String, rpm: Int, fanID: Int?, triggerTemp: Int?) {
         let key = ProcessRuleResolver.normalized(name)
-        guard !key.isEmpty, rpm > 0, (fanID ?? 0) >= 0 else { return }
+        guard rpm > 0, (fanID ?? 0) >= 0,
+              triggerTemp.map({ RuleTemperature.range.contains($0) }) ?? true,
+              !key.isEmpty || triggerTemp != nil else { return }
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Process rules are unique per process and fan; temperature-only rules per fan and threshold.
         if let index = processRules.firstIndex(where: {
             ProcessRuleResolver.normalized($0.name) == key && $0.fanID == fanID
+                && (!key.isEmpty || $0.triggerTemp == triggerTemp)
         }) {
             processRules[index].rpm = rpm
+            processRules[index].triggerTemp = triggerTemp
             processRules[index].enabled = true
         } else {
-            processRules.append(ProcessRule(name: trimmed, rpm: rpm, fanID: fanID))
+            processRules.append(ProcessRule(name: trimmed, rpm: rpm, fanID: fanID, triggerTemp: triggerTemp))
         }
+        commitProcessRules()
+    }
+
+    /// nil removes the temperature condition, which is only allowed for process rules.
+    func setProcessRule(id: UUID, triggerTemp: Int?) {
+        guard let index = processRules.firstIndex(where: { $0.id == id }) else { return }
+        if let triggerTemp {
+            guard RuleTemperature.range.contains(triggerTemp) else { return }
+        } else if processRules[index].isTemperatureOnly {
+            return
+        }
+        processRules[index].triggerTemp = triggerTemp
         commitProcessRules()
     }
 
@@ -477,14 +501,16 @@ private final class FanModel: ObservableObject {
     /// Edge-triggered per fan: a fan is touched only when its resolved target
     /// changes, so a manual override stays until a rule for that fan changes.
     private func evaluateProcessRules(running: Set<String>?) {
-        let hasEnabledRules = processRules.contains { $0.enabled }
-        // The scan result predates a rule being enabled; wait for the next read.
-        if running == nil && hasEnabledRules { return }
+        let needsProcessScan = processRules.contains { $0.enabled && !$0.isTemperatureOnly }
+        // The scan result predates a process rule being enabled; wait for the next read.
+        if running == nil && needsProcessScan { return }
         let match = ProcessRuleResolver.resolve(
-            rules: processRules, running: running ?? [], fanIDs: fans.map(\.id)
+            rules: processRules, running: running ?? [], fanIDs: fans.map(\.id),
+            temperature: TemperatureSource.cpuCelsius(temperatures), wasTriggered: ruleTriggered
         )
         if ruleMatch != match { ruleMatch = match }
         let desired = match?.targets ?? [:]
+        ruleTriggered = Set(desired.keys)
 
         // A fan neither wanted nor held by a rule has nothing to remember.
         for fan in Array(ruleApplied.keys) where desired[fan] == nil && !ruleOwned.contains(fan) {
@@ -571,6 +597,19 @@ private final class FanModel: ObservableObject {
             rescheduleStatusTimer()
         } else if controlDeadline == nil && currentStatusDisplayMode == "countdown" {
             statusRotationIndex = (statusRotationIndex + 1) % 2
+        }
+    }
+
+    private func trackUnlimitedHold(request: FanControlRequest, response: FanControlResponse) {
+        guard response.success else { return }
+        switch request.command {
+        case "set":
+            guard let fan = request.fan else { return }
+            if request.seconds == 0 { unlimitedFans.insert(fan) } else { unlimitedFans.remove(fan) }
+        case "auto":
+            if let fan = request.fan { unlimitedFans.remove(fan) } else { unlimitedFans.removeAll() }
+        default:
+            break
         }
     }
 
@@ -670,10 +709,7 @@ private struct MenuBarLabel: View {
     @AppStorage("statusDisplayMode") private var statusDisplayMode = "fan"
 
     private var cpuTemperature: Double? {
-        let candidates = ["CPU Die", "CPU Proximity", "CPU Core"]
-        return candidates.lazy.compactMap { name in
-            model.temperatures.first(where: { $0.name == name })?.celsius
-        }.first
+        TemperatureSource.cpuCelsius(model.temperatures)
     }
 
     private var batteryTemperature: Double? {
@@ -775,6 +811,7 @@ private struct FanMenuView: View {
                     FanMenuRow(
                         fan: model.controlSnapshot(fan),
                         busy: model.busy,
+                        heldUnlimited: model.unlimitedFans.contains(fan.id),
                         startupEnabled: startupFanEnabled && startupFanID == fan.id,
                         startupFanRPM: startupFanRPM,
                         set: { rpm, seconds in
@@ -794,10 +831,12 @@ private struct FanMenuView: View {
                     match: model.ruleMatch,
                     fans: ruleFanRanges,
                     busy: model.busy,
-                    add: { model.addProcessRule(name: $0, rpm: $1, fanID: $2) },
+                    cpuTemperature: TemperatureSource.cpuCelsius(model.temperatures),
+                    add: { model.addProcessRule(name: $0, rpm: $1, fanID: $2, triggerTemp: $3) },
                     remove: { model.removeProcessRule(id: $0) },
                     setEnabled: { model.setProcessRule(id: $0, enabled: $1) },
-                    setRPM: { model.setProcessRule(id: $0, rpm: $1) }
+                    setRPM: { model.setProcessRule(id: $0, rpm: $1) },
+                    setTriggerTemp: { model.setProcessRule(id: $0, triggerTemp: $1) }
                 )
             }
 
@@ -882,6 +921,7 @@ private struct FanMenuView: View {
 private struct FanMenuRow: View {
     let fan: FanSnapshot
     let busy: Bool
+    let heldUnlimited: Bool
     let startupEnabled: Bool
     let startupFanRPM: Double
     let set: (Int, Int) -> Void
@@ -895,6 +935,7 @@ private struct FanMenuRow: View {
     init(
         fan: FanSnapshot,
         busy: Bool,
+        heldUnlimited: Bool,
         startupEnabled: Bool,
         startupFanRPM: Double,
         set: @escaping (Int, Int) -> Void,
@@ -903,6 +944,7 @@ private struct FanMenuRow: View {
     ) {
         self.fan = fan
         self.busy = busy
+        self.heldUnlimited = heldUnlimited
         self.startupEnabled = startupEnabled
         self.startupFanRPM = startupFanRPM
         self.set = set
@@ -918,11 +960,21 @@ private struct FanMenuRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
             HStack {
+                Image(systemName: "fan.fill")
+                    .foregroundStyle(iconColor)
+                    .accessibilityHidden(true)
                 Text("风扇 #\(fan.id)").font(.subheadline.weight(.medium))
                 Spacer()
                 Text("\(Int(fan.currentRPM)) RPM")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
+            }
+
+            if FanSafety.showsHighSpeedWarning(fan: fan, heldUnlimited: heldUnlimited) {
+                Label(FanSafety.highSpeedWarning, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             HStack(spacing: 8) {
@@ -970,6 +1022,13 @@ private struct FanMenuRow: View {
         .disabled(busy)
         .onChange(of: fan.minimumRPM) { _ in clampRPM() }
         .onChange(of: fan.maximumRPM) { _ in clampRPM() }
+    }
+
+    // Same thresholds as the menu bar icon.
+    private var iconColor: Color {
+        if fan.currentRPM >= 5_000 { return .red }
+        if fan.currentRPM >= 3_500 { return .orange }
+        return .primary
     }
 
     private var snappedRPM: Int {

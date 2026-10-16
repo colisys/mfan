@@ -1,7 +1,16 @@
 import Darwin
 import Foundation
 
-/// "When this process is running, hold the fan(s) at `rpm`."
+enum RuleTemperature {
+    static let range = 40...100
+    static let step = 5
+    static let defaultCelsius = 80
+    /// Once fired, a rule holds until the CPU falls this far below its threshold,
+    /// so the fan does not flap on and off around the threshold.
+    static let hysteresis = 5.0
+}
+
+/// "While this process runs (and/or the CPU is hot enough), hold the fan(s) at `rpm`."
 struct ProcessRule: Codable, Identifiable, Equatable {
     var id: UUID
     var name: String
@@ -9,14 +18,23 @@ struct ProcessRule: Codable, Identifiable, Equatable {
     var enabled: Bool
     /// nil applies to every fan. Rules saved before per-fan support decode as nil.
     var fanID: Int?
+    /// CPU °C at which the rule fires. nil fires as soon as the process runs.
+    /// Rules saved before temperature support decode as nil.
+    var triggerTemp: Int?
 
-    init(id: UUID = UUID(), name: String, rpm: Int, enabled: Bool = true, fanID: Int? = nil) {
+    init(id: UUID = UUID(), name: String, rpm: Int, enabled: Bool = true, fanID: Int? = nil,
+         triggerTemp: Int? = nil) {
         self.id = id
         self.name = name
         self.rpm = rpm
         self.enabled = enabled
         self.fanID = fanID
+        self.triggerTemp = triggerTemp
     }
+
+    /// An empty name means no process condition: the rule depends on temperature alone.
+    var isTemperatureOnly: Bool { ProcessRuleResolver.normalized(name).isEmpty }
+    var displayName: String { isTemperatureOnly ? "温度触发" : name }
 }
 
 enum ProcessRuleStore {
@@ -25,8 +43,11 @@ enum ProcessRuleStore {
     static func load(from defaults: UserDefaults = .standard) -> [ProcessRule] {
         guard let data = defaults.data(forKey: defaultsKey),
               let rules = try? JSONDecoder().decode([ProcessRule].self, from: data) else { return [] }
-        return rules.filter {
-            !ProcessRuleResolver.normalized($0.name).isEmpty && $0.rpm > 0 && ($0.fanID ?? 0) >= 0
+        return rules.filter { rule in
+            let validTemperature = rule.triggerTemp.map { (20...120).contains($0) } ?? true
+            // A rule needs a process, a temperature, or both.
+            let hasCondition = !rule.isTemperatureOnly || rule.triggerTemp != nil
+            return validTemperature && hasCondition && rule.rpm > 0 && (rule.fanID ?? 0) >= 0
         }
     }
 
@@ -44,9 +65,12 @@ struct ProcessRuleMatch: Equatable {
     let winners: [String]
     /// Every enabled rule whose process is currently running.
     let activeIDs: Set<UUID>
+    /// Rules whose process runs but whose temperature has not been reached yet.
+    let armedIDs: Set<UUID>
 
     /// "3000 RPM" when all fans share one target, otherwise "#0 3000 · #1 4000 RPM".
     var rpmSummary: String {
+        if targets.isEmpty { return "" }
         let values = Set(targets.values)
         if values.count == 1, let only = values.first { return "\(only) RPM" }
         return targets.sorted { $0.key < $1.key }
@@ -62,27 +86,51 @@ enum ProcessRuleResolver {
         return value
     }
 
-    /// Per fan, the highest RPM among matching rules wins. A rule with a nil
-    /// `fanID` applies to every fan in `fanIDs`; a rule for an unknown fan is inert.
-    static func resolve(rules: [ProcessRule], running: Set<String>, fanIDs: [Int]) -> ProcessRuleMatch? {
+    /// Per fan, every live rule (process running, or temperature-only) joins one
+    /// effective rule with the LOWEST trigger temperature and the HIGHEST RPM. A rule
+    /// without a temperature fires at launch, which counts as the lowest threshold.
+    /// A rule with a nil `fanID` applies to every fan in `fanIDs`; one for an unknown
+    /// fan is inert. `wasTriggered` adds hysteresis for fans already held.
+    static func resolve(
+        rules: [ProcessRule], running: Set<String>, fanIDs: [Int],
+        temperature: Double? = nil, wasTriggered: Set<Int> = []
+    ) -> ProcessRuleMatch? {
         let normalizedRunning = Set(running.map(normalized))
-        let matched = rules.filter {
-            $0.enabled && $0.rpm > 0 && normalizedRunning.contains(normalized($0.name))
+        let live = rules.filter {
+            $0.enabled && $0.rpm > 0 && ($0.isTemperatureOnly
+                ? $0.triggerTemp != nil
+                : normalizedRunning.contains(normalized($0.name)))
         }
         var targets: [Int: Int] = [:]
         var winners: [String] = []
         var active = Set<UUID>()
+        var armed = Set<UUID>()
         for fan in fanIDs {
-            let applicable = matched.filter { $0.fanID == nil || $0.fanID == fan }
+            let applicable = live.filter { $0.fanID == nil || $0.fanID == fan }
             guard let top = applicable.map(\.rpm).max() else { continue }
-            targets[fan] = top
-            for rule in applicable {
-                active.insert(rule.id)
-                if rule.rpm == top && !winners.contains(rule.name) { winners.append(rule.name) }
+            let threshold: Int? = applicable.contains { $0.triggerTemp == nil }
+                ? nil : applicable.compactMap(\.triggerTemp).min()
+            let fires: Bool
+            if let threshold {
+                let release = wasTriggered.contains(fan) ? RuleTemperature.hysteresis : 0
+                // An unreadable temperature never fires a temperature condition.
+                fires = (temperature ?? -.infinity) >= Double(threshold) - release
+            } else {
+                fires = true
+            }
+            if fires {
+                targets[fan] = top
+                for rule in applicable {
+                    active.insert(rule.id)
+                    if rule.rpm == top && !winners.contains(rule.displayName) { winners.append(rule.displayName) }
+                }
+            } else {
+                armed.formUnion(applicable.map(\.id))
             }
         }
-        guard !targets.isEmpty else { return nil }
-        return ProcessRuleMatch(targets: targets, winners: winners, activeIDs: active)
+        armed.subtract(active)
+        guard !targets.isEmpty || !armed.isEmpty else { return nil }
+        return ProcessRuleMatch(targets: targets, winners: winners, activeIDs: active, armedIDs: armed)
     }
 }
 
