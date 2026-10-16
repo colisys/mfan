@@ -155,7 +155,9 @@ struct ProcessRulesSection: View {
                             }
                         }
                     }
-                    .frame(maxHeight: 132)
+                    .frame(
+                        height: rules.isEmpty ? 0 : min(CGFloat(rules.count) * 96, 260)
+                    )
 
                     addForm
                 }

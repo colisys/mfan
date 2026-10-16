@@ -2,7 +2,7 @@ import FanCore
 
 enum FanSafety {
     /// Fraction of the fan's maximum RPM at which the warning starts.
-    static let highSpeedFraction = 0.75
+    static let highSpeedFraction = 0.85
 
     static let highSpeedWarning = "请勿让风扇长时间不限时高速运作，以免损坏机械结构"
 
