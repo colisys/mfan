@@ -5,7 +5,7 @@ struct ThermalSection: View {
     let configuration: ThermalConfiguration
     let currentTemperature: Double?
     let busy: Bool
-    let save: (ThermalConfiguration) -> Void
+    let save: @MainActor (ThermalConfiguration) -> Void
     @State private var draftEnabled = false
     @State private var draftCurve = ThermalBezier.standard
     /// What the last "apply" sent, so the model echoing it back does not overwrite the draft.

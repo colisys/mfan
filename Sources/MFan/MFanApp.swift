@@ -18,7 +18,7 @@ struct MFanApp: App {
             ControlCenterView(model: model)
                 .background(TouchBarInstaller(model: model))
         }
-        .windowStyle(.hiddenTitleBar)
+        .windowStyle(.titleBar)
         .defaultSize(width: 1040, height: 680)
     }
 }

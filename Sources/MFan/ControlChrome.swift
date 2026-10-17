@@ -32,6 +32,11 @@ struct WindowConfigurator: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView { ConfigView() }
     func updateNSView(_ view: NSView, context: Context) {}
 
+    private static var usesModernTitleBar: Bool {
+        if #available(macOS 14, *) { return true }
+        return false
+    }
+
     private final class ConfigView: NSView {
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
@@ -40,6 +45,18 @@ struct WindowConfigurator: NSViewRepresentable {
             window.titlebarAppearsTransparent = true
             window.isOpaque = false
             window.backgroundColor = .clear
+
+            // On macOS 13, hiddenTitleBar removes the traffic-light buttons.
+            // Keep the title-bar container and only hide the buttons on 14+.
+            DispatchQueue.main.async { [weak window] in
+                guard let window else { return }
+                let buttons = [
+                    window.standardWindowButton(.closeButton),
+                    window.standardWindowButton(.miniaturizeButton),
+                    window.standardWindowButton(.zoomButton)
+                ]
+                buttons.forEach { $0?.isHidden = WindowConfigurator.usesModernTitleBar }
+            }
         }
     }
 }
