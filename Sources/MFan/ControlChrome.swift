@@ -117,5 +117,10 @@ struct ControlStatusBar: View {
         .padding(.horizontal, 22)
         .frame(height: 46)
         .background(.bar)
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(Color(nsColor: .separatorColor).opacity(0.5))
+                .frame(height: 1)
+        }
     }
 }

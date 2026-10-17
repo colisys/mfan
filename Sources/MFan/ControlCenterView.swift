@@ -58,7 +58,6 @@ struct ControlCenterView: View {
                     }
                     .id(page)
                 }
-                Divider()
                 ControlStatusBar(model: model)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
