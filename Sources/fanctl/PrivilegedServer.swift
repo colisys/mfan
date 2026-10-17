@@ -16,6 +16,7 @@ extension SMCClient: ServiceFanHardware {}
 
 final class PrivilegedFanServer {
     private let socketPath: String
+    private let ownerUID: uid_t
     private let client: ServiceFanHardware
     private let clock: () -> ServiceClockSample
     private var serverFD: Int32 = -1
@@ -40,14 +41,16 @@ final class PrivilegedFanServer {
         let error: String
     }
 
-    init(socketPath: String) throws {
+    init(socketPath: String, ownerUID: uid_t = getuid()) throws {
         self.socketPath = socketPath
+        self.ownerUID = ownerUID
         client = try SMCClient()
         clock = ServiceClockSample.now
     }
 
-    init(socketPath: String, client: ServiceFanHardware, clock: @escaping () -> ServiceClockSample) {
+    init(socketPath: String, ownerUID: uid_t = getuid(), client: ServiceFanHardware, clock: @escaping () -> ServiceClockSample) {
         self.socketPath = socketPath
+        self.ownerUID = ownerUID
         self.client = client
         self.clock = clock
     }
@@ -102,6 +105,12 @@ final class PrivilegedFanServer {
             if descriptors[0].revents & Int16(POLLIN) != 0 {
                 let fd = accept(serverFD, nil, nil)
                 if fd >= 0 {
+                    var peerUID: uid_t = 0
+                    var peerGID: gid_t = 0
+                    guard getpeereid(fd, &peerUID, &peerGID) == 0, peerUID == ownerUID else {
+                        close(fd)
+                        continue
+                    }
                     if peers.count >= 32 {
                         close(fd)
                     } else {
@@ -291,9 +300,10 @@ final class PrivilegedFanServer {
             throw serviceError("无法确认控制 socket 身份")
         }
         socketIdentity = (info.st_dev, info.st_ino)
-        // Existing local-session transport permissions; deployment authentication
-        // is separate from the heartbeat watchdog.
-        guard chmod(socketPath, S_IRUSR | S_IWUSR | S_IROTH | S_IWOTH) == 0,
+        // Restrict access to the user who authorized this session; also check
+        // peer credentials on every connection. This is not code-signature authentication.
+        guard chown(socketPath, ownerUID, gid_t.max) == 0,
+              chmod(socketPath, S_IRUSR | S_IWUSR) == 0,
               listen(serverFD, 8) == 0, fcntl(serverFD, F_SETFL, O_NONBLOCK) == 0 else {
             close(serverFD)
             cleanupSocket()

@@ -467,7 +467,7 @@ final class FanModel: ObservableObject {
                     try? FileManager.default.removeItem(atPath: self.serviceLogPath)
                     let script = CommandRunner.authorizationScript(
                         cli: cli,
-                        arguments: ["serve", self.socketPath],
+                        arguments: ["serve", self.socketPath, String(getuid())],
                         background: true,
                         backgroundLogPath: self.serviceLogPath
                     )

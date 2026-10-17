@@ -10,7 +10,7 @@ func usage() -> Never {
       \(name) status                       列出所有风扇状态（JSON）
       \(name) set <风扇编号> <RPM> <秒数>   手动设定转速（需要 root，30-600秒）
       \(name) auto [风扇编号]               恢复系统自动控制（缺省为全部，需要 root）
-      \(name) serve <socket>                 启动一次性本地特权控制服务（需要 root）
+      \(name) serve <socket> <用户 UID>      启动一次性本地特权控制服务（需要 root）
     """)
     exit(1)
 }
@@ -18,9 +18,9 @@ func usage() -> Never {
 guard let cmd = args.first else { usage() }
 
 if cmd == "serve" {
-    guard args.count == 2 else { usage() }
+    guard args.count == 3, let ownerUID = uid_t(args[2]) else { usage() }
     do {
-        try PrivilegedFanServer(socketPath: args[1]).run()
+        try PrivilegedFanServer(socketPath: args[1], ownerUID: ownerUID).run()
         exit(0)
     } catch {
         fputs("错误：\(error.localizedDescription)\n", stderr)

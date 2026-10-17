@@ -52,7 +52,7 @@ struct ControlCenterView: View {
                 GeometryReader { proxy in
                     ScrollView {
                         content
-                            .padding(EdgeInsets(top: 30, leading: 22, bottom: 22, trailing: 22))
+                            .padding(EdgeInsets(top: 22, leading: 22, bottom: 22, trailing: 22))
                             .frame(maxWidth: .infinity, minHeight: proxy.size.height, alignment: .top)
                             .environment(\.controlPageHeight, max(0, proxy.size.height - 52))
                     }
@@ -63,11 +63,9 @@ struct ControlCenterView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Color(nsColor: .windowBackgroundColor))
-            .overlay(alignment: .top) { WindowDragArea().frame(height: 26) }
+
         }
-        .ignoresSafeArea()
         .frame(minWidth: 900, minHeight: 640)
-        .background(WindowConfigurator())
         .onAppear { model.refresh() }
     }
 
@@ -125,10 +123,10 @@ private struct ControlSidebar: View {
             }
             .padding(.horizontal, 10)
         }
-        .padding(EdgeInsets(top: 48, leading: 12, bottom: 14, trailing: 12))
+        .padding(EdgeInsets(top: 14, leading: 12, bottom: 14, trailing: 12))
         .frame(maxHeight: .infinity, alignment: .top)
         .background(SidebarMaterial())
-        .overlay(alignment: .top) { WindowDragArea().frame(height: 40) }
+
     }
 }
 
