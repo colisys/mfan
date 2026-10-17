@@ -9,23 +9,52 @@ struct ActiveRulesSummary: View {
     let cpuTemperature: Double?
     let open: () -> Void
 
-    private var effectiveRules: [(name: String, detail: String, on: Bool)] {
-        guard let match else { return [] }
-        let all = match.winners.map { ($0, $0 == "全局温控") }
-        let nonGlobal = all.filter { !$0.1 }
-        
-        if !nonGlobal.isEmpty {
-            // Rules override global: show only rules
-            return nonGlobal.map { ($0.0, "生效中", true) }
-        } else if !all.isEmpty {
-            // Only global is winning: show it with status
-            return [("全局温控", globalDetail, thermal.enabled)]
-        } else {
-            return []
-        }
+    private struct SummaryItem: Identifiable {
+        let id: String
+        let name: String
+        let detail: String
+        let on: Bool
     }
 
-    private var waitingCount: Int { match?.armedIDs.count ?? 0 }
+    /// `winners` only contains rules that produced the highest target RPM. It is
+    /// not the same as all running rules, so derive the menu summary from the
+    /// rule IDs as well and use winners only to describe precedence.
+    private var items: [SummaryItem] {
+        guard let match else {
+            return thermal.enabled
+                ? [SummaryItem(id: "global", name: "全局温控", detail: globalDetail, on: true)]
+                : []
+        }
+
+        let winnerNames = Set(match.winners)
+        let activeRules = rules.filter { match.activeIDs.contains($0.id) }
+        let armedRules = rules.filter { match.armedIDs.contains($0.id) }
+        var result: [SummaryItem] = []
+
+        for rule in activeRules {
+            let name = rule.displayName
+            let isWinner = winnerNames.contains(name)
+            result.append(SummaryItem(
+                id: rule.id.uuidString,
+                name: name,
+                detail: isWinner ? "生效中" : "运行中 · 未超过当前目标",
+                on: isWinner
+            ))
+        }
+        for rule in armedRules {
+            result.append(SummaryItem(
+                id: "armed-\(rule.id.uuidString)",
+                name: rule.displayName,
+                detail: "等待触发",
+                on: false
+            ))
+        }
+
+        if winnerNames.contains("全局温控") {
+            result.append(SummaryItem(id: "global", name: "全局温控", detail: globalDetail, on: thermal.enabled))
+        }
+        return result
+    }
 
     private var globalDetail: String {
         guard thermal.enabled else { return "未启用" }
@@ -51,11 +80,10 @@ struct ActiveRulesSummary: View {
                         .lineLimit(1)
                 }
             }
-            if effectiveRules.isEmpty {
-                line(title: "规则", detail: waitingCount > 0 ? "\(waitingCount) 条等待触发"
-                     : (rules.isEmpty ? "未设置" : "无生效"), on: false)
+            if items.isEmpty {
+                line(title: "规则", detail: rules.isEmpty ? "未设置" : "无生效", on: false)
             } else {
-                ForEach(effectiveRules, id: \.name) { item in
+                ForEach(items) { item in
                     line(title: item.name, detail: item.detail, on: item.on)
                 }
             }
